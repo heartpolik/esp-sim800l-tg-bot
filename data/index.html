@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caller Bot Admin</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f0f2f5; color: #1a1a1a; }
+  .container { max-width: 720px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: 24px; }
+  h2 { font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: #555; text-transform: uppercase; letter-spacing: .05em; }
+  .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: .85rem; font-weight: 500; margin-bottom: 4px; color: #444; }
+  .field input { width: 100%; padding: 8px 10px; border: 1px solid #d0d5dd; border-radius: 6px; font-size: .95rem; outline: none; transition: border-color .15s; }
+  .field input:focus { border-color: #4f7df3; }
+  .row { display: flex; gap: 8px; align-items: flex-start; }
+  .row .field { flex: 1; margin-bottom: 0; }
+  .alias-card { border: 1px solid #e4e7ec; border-radius: 8px; padding: 14px; margin-bottom: 10px; position: relative; }
+  .alias-card .alias-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .alias-card .alias-title { font-weight: 600; font-size: .9rem; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: none; border-radius: 6px; font-size: .9rem; font-weight: 500; cursor: pointer; transition: opacity .15s; }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: #4f7df3; color: #fff; }
+  .btn-danger  { background: #ef4444; color: #fff; padding: 6px 10px; font-size: .8rem; }
+  .btn-ghost   { background: #f3f4f6; color: #333; }
+  .btn-add     { background: #e8f0fe; color: #3b6ef0; margin-top: 4px; }
+  .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+  .stat { background: #f8f9fb; border-radius: 8px; padding: 12px; text-align: center; }
+  .stat-val { font-size: 1.3rem; font-weight: 700; }
+  .stat-label { font-size: .78rem; color: #888; margin-top: 2px; }
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1a1a1a; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: .9rem; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .users-hint { font-size: .78rem; color: #888; margin-top: 3px; }
+  #save-btn { width: 100%; margin-top: 8px; padding: 12px; font-size: 1rem; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Caller Bot Admin</h1>
+
+  <!-- Status -->
+  <div class="card">
+    <h2>Device Status</h2>
+    <div class="status-grid" id="status-grid">
+      <div class="stat"><div class="stat-val" id="s-csq">—</div><div class="stat-label">Signal (0-31)</div></div>
+      <div class="stat"><div class="stat-val" id="s-bat">—</div><div class="stat-label">Battery</div></div>
+      <div class="stat"><div class="stat-val" id="s-call">—</div><div class="stat-label">Call</div></div>
+    </div>
+    <button class="btn btn-ghost" style="margin-top:12px;font-size:.85rem" onclick="loadStatus()">Refresh</button>
+  </div>
+
+  <!-- Credentials -->
+  <div class="card">
+    <h2>Credentials</h2>
+    <div class="field"><label>WiFi SSID</label><input id="wifi_ssid" placeholder="MyNetwork"></div>
+    <div class="field"><label>WiFi Password</label><input id="wifi_password" type="password" placeholder="••••••••"></div>
+    <div class="field"><label>Telegram Bot Token</label><input id="bot_token" placeholder="123456789:ABCxxxxx"></div>
+    <div class="field"><label>Admin Panel Password</label><input id="admin_password" type="password" placeholder="changeme"></div>
+  </div>
+
+  <!-- USSD + Call settings -->
+  <div class="card">
+    <h2>Call Settings</h2>
+    <div class="row">
+      <div class="field">
+        <label>USSD Code (/echo)</label>
+        <input id="ussd_code" placeholder="*123#">
+      </div>
+      <div class="field">
+        <label>Auto-hangup (seconds)</label>
+        <input id="call_timeout_s" type="number" min="5" max="3600" placeholder="60">
+      </div>
+    </div>
+  </div>
+
+  <!-- Aliases -->
+  <div class="card">
+    <h2>Phone Aliases</h2>
+    <div id="aliases-container"></div>
+    <button class="btn btn-add" onclick="addAlias()">+ Add Alias</button>
+  </div>
+
+  <button class="btn btn-primary" id="save-btn" onclick="saveConfig()">Save &amp; Restart Device</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let config = { aliases: [] };
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) { showToast('Failed to load config', true); return; }
+    config = await r.json();
+    document.getElementById('wifi_ssid').value      = config.wifi_ssid      || '';
+    document.getElementById('wifi_password').value  = config.wifi_password  || '';
+    document.getElementById('bot_token').value      = config.bot_token      || '';
+    document.getElementById('admin_password').value = config.admin_password || '';
+    document.getElementById('ussd_code').value      = config.ussd_code      || '';
+    document.getElementById('call_timeout_s').value = config.call_timeout_s || 60;
+    config.aliases = config.aliases || [];
+    renderAliases();
+  } catch(e) { showToast('Network error', true); }
+}
+
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById('s-csq').textContent  = d.csq !== undefined ? d.csq : '—';
+    document.getElementById('s-bat').textContent  = d.battery_pct !== undefined ? d.battery_pct + '%' : 'n/a';
+    document.getElementById('s-call').textContent = d.call || '—';
+  } catch(e) {}
+}
+
+function renderAliases() {
+  const c = document.getElementById('aliases-container');
+  c.innerHTML = '';
+  config.aliases.forEach((alias, idx) => {
+    const div = document.createElement('div');
+    div.className = 'alias-card';
+    div.innerHTML = `
+      <div class="alias-header">
+        <span class="alias-title">/${alias.command || 'new'}</span>
+        <button class="btn btn-danger" onclick="removeAlias(${idx})">Remove</button>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Command (no /)</label>
+          <input value="${esc(alias.command)}" placeholder="home" oninput="config.aliases[${idx}].command=this.value;updateTitle(this,${idx})">
+        </div>
+        <div class="field">
+          <label>Button Label</label>
+          <input value="${esc(alias.label||'')}" placeholder="🏠 Дім" oninput="config.aliases[${idx}].label=this.value">
+        </div>
+        <div class="field">
+          <label>Phone Number</label>
+          <input value="${esc(alias.phone)}" placeholder="+380XXXXXXXXX" oninput="config.aliases[${idx}].phone=this.value">
+        </div>
+      </div>
+      <div class="field" style="margin-top:8px">
+        <label>Allowed Telegram User IDs</label>
+        <input value="${(alias.allowed_users||[]).join(', ')}" placeholder="123456789, 987654321"
+               oninput="config.aliases[${idx}].allowed_users=this.value.split(',').map(s=>s.trim()).filter(Boolean).map(Number)">
+        <div class="users-hint">Comma-separated. Get your ID from @userinfobot on Telegram.</div>
+      </div>
+    `;
+    c.appendChild(div);
+  });
+}
+
+function updateTitle(input, idx) {
+  const card = input.closest('.alias-card');
+  card.querySelector('.alias-title').textContent = '/' + (input.value || 'new');
+}
+
+function addAlias() {
+  config.aliases.push({ command: '', phone: '', allowed_users: [] });
+  renderAliases();
+  document.getElementById('aliases-container').lastElementChild
+    .querySelector('input')
+    .focus();
+}
+
+function removeAlias(idx) {
+  config.aliases.splice(idx, 1);
+  renderAliases();
+}
+
+async function saveConfig() {
+  config.wifi_ssid      = document.getElementById('wifi_ssid').value.trim();
+  config.wifi_password  = document.getElementById('wifi_password').value;
+  config.bot_token      = document.getElementById('bot_token').value.trim();
+  config.admin_password = document.getElementById('admin_password').value;
+  config.ussd_code      = document.getElementById('ussd_code').value.trim();
+  config.call_timeout_s = parseInt(document.getElementById('call_timeout_s').value) || 60;
+
+  // validate
+  for (const a of config.aliases) {
+    if (!a.command || !a.phone) { showToast('All aliases need command and phone', true); return; }
+    if (!/^[a-z0-9_]+$/.test(a.command)) { showToast('Command "' + a.command + '" must be lowercase letters/digits/underscore', true); return; }
+  }
+
+  const btn = document.getElementById('save-btn');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    if (r.ok) {
+      showToast('Saved! Device is restarting...');
+      btn.textContent = 'Saved — reconnecting...';
+      setTimeout(() => { btn.disabled = false; btn.textContent = 'Save & Restart Device'; loadConfig(); }, 6000);
+    } else {
+      showToast('Save failed (HTTP ' + r.status + ')', true);
+      btn.disabled = false;
+      btn.textContent = 'Save & Restart Device';
+    }
+  } catch(e) {
+    showToast('Device restarting — wait a moment', false);
+    btn.textContent = 'Reconnecting...';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Save & Restart Device'; loadConfig(); }, 6000);
+  }
+}
+
+function esc(s) {
+  return (s || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}
+
+function showToast(msg, isErr = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = isErr ? '#ef4444' : '#1a1a1a';
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+loadConfig();
+loadStatus();
+</script>
+</body>
+</html>

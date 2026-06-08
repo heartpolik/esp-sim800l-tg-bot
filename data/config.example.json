@@ -1,0 +1,22 @@
+{
+  "wifi_ssid": "your_wifi_ssid",
+  "wifi_password": "your_wifi_password",
+  "bot_token": "123456789:ABCxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "admin_password": "changeme",
+  "ussd_code": "*123#",
+  "call_timeout_s": 60,
+  "aliases": [
+    {
+      "command": "home",
+      "label": "🏠 Дім",
+      "phone": "+380XXXXXXXXX",
+      "allowed_users": [123456789]
+    },
+    {
+      "command": "mom",
+      "label": "👩 Мама",
+      "phone": "+380YYYYYYYYY",
+      "allowed_users": [123456789, 987654321]
+    }
+  ]
+}

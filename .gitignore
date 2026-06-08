@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+data/config.json
+*.bin
+*.elf
