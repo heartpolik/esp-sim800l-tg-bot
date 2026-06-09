@@ -72,6 +72,9 @@
         <label>Auto-hangup (seconds)</label>
         <input id="call_timeout_s" type="number" min="5" max="3600" placeholder="60">
       </div>
+      <div class="field">
+        <label><input id="display_flip" type="checkbox"> Flip display 180°</label>
+      </div>
     </div>
   </div>
 
@@ -101,6 +104,7 @@ async function loadConfig() {
     document.getElementById('admin_password').value = config.admin_password || '';
     document.getElementById('ussd_code').value      = config.ussd_code      || '';
     document.getElementById('call_timeout_s').value = config.call_timeout_s || 60;
+    document.getElementById('display_flip').checked  = config.display_flip   || false;
     config.aliases = config.aliases || [];
     renderAliases();
   } catch(e) { showToast('Network error', true); }
@@ -178,6 +182,7 @@ async function saveConfig() {
   config.admin_password = document.getElementById('admin_password').value;
   config.ussd_code      = document.getElementById('ussd_code').value.trim();
   config.call_timeout_s = parseInt(document.getElementById('call_timeout_s').value) || 60;
+  config.display_flip   = document.getElementById('display_flip').checked;
 
   // validate
   for (const a of config.aliases) {

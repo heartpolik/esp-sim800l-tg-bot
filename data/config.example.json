@@ -5,6 +5,8 @@
   "admin_password": "changeme",
   "ussd_code": "*123#",
   "call_timeout_s": 60,
+  "gmt_offset_h": 2,
+  "display_flip": false,
   "aliases": [
     {
       "command": "home",

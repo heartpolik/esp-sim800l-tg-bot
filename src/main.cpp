@@ -12,7 +12,15 @@
 #include <UniversalTelegramBot.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
+#include <ElegantOTA.h>
+#include <time.h>
 #include <vector>
+
+// E-Paper — must come after Arduino.h
+#include <GxEPD2_3C.h>
+#include <epd3c/GxEPD2_213c.h>
+#include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
 
 // ─── Config structs ───────────────────────────────────────────────────────────
 
@@ -30,6 +38,8 @@ struct AppConfig {
     String adminPassword;
     String ussdCode;
     unsigned long callTimeoutMs = CALL_TIMEOUT_MS;
+    int gmtOffsetH = 2;
+    bool displayFlip = false;
     std::vector<Alias> aliases;
 };
 
@@ -61,6 +71,15 @@ bool          shouldRestart  = false;
 unsigned long restartAfterMs = 0;
 bool          apMode         = false;
 
+// E-Paper display (HSPI — avoids GPIO 23 conflict with MODEM_POWER_ON)
+SPIClass epaperSPI(HSPI);
+GxEPD2_3C<GxEPD2_213c, GxEPD2_213c::HEIGHT> display(
+    GxEPD2_213c(EPAPER_CS, EPAPER_DC, EPAPER_RST, EPAPER_BUSY));
+
+// Last-call tracking
+String lastCmdLabel = "";
+String lastCmdTime  = "";
+
 // ─── Config IO ───────────────────────────────────────────────────────────────
 
 void loadConfig() {
@@ -84,6 +103,8 @@ void loadConfig() {
     cfg.ussdCode       = doc["ussd_code"]        | "";
     int timeoutSec     = doc["call_timeout_s"]   | 0;
     cfg.callTimeoutMs  = timeoutSec > 0 ? (unsigned long)timeoutSec * 1000 : CALL_TIMEOUT_MS;
+    cfg.gmtOffsetH     = doc["gmt_offset_h"]     | 2;
+    cfg.displayFlip    = doc["display_flip"]     | false;
     cfg.aliases.clear();
     for (JsonObject a : doc["aliases"].as<JsonArray>()) {
         Alias alias;
@@ -114,8 +135,11 @@ bool isAllowedForAlias(long userId, const Alias& alias) {
     return false;
 }
 
-// forward declaration
+// forward declarations
 void sendMenu(const String& chatId, long userId, const String& text);
+void displayIdle(const String& sub = "Waiting for command");
+void displayCalling(const String& label);
+String getTimeStr();
 
 // ─── Direct Telegram POST (bypasses library's broken sendPostMessage) ─────────
 
@@ -176,9 +200,10 @@ void tickCallProgress() {
         callState   = CallState::IDLE;
         lastGsmStat = GsmCallStat::NONE;
         unsigned long dur = (millis() - callStartMs) / 1000;
+        String endMsg = "📵 Call ended after " + String(dur) + "s.";
         if (lastChatId.length() && bot)
-            sendMenu(lastChatId, lastUserId,
-                "📵 Call ended after " + String(dur) + "s.");
+            sendMenu(lastChatId, lastUserId, endMsg);
+        displayIdle("Call ended " + String(dur) + "s");
         return;
     }
 
@@ -237,7 +262,7 @@ String buildKeyboard(long userId) {
     statusBtn["callback_data"] = "status";
     if (cfg.ussdCode.length()) {
         JsonObject echoBtn = actionRow.createNestedObject();
-        echoBtn["text"]          = "📡 Balance";
+        echoBtn["text"]          = "💵 Balance";
         echoBtn["callback_data"] = "echo";
     }
 
@@ -267,11 +292,14 @@ void handleCall(const String& chatId, const Alias& alias) {
         return;
     }
     if (modem.callNumber(alias.phone.c_str())) {
-        callState   = CallState::CALLING;
-        callStartMs = millis();
-        lastGsmStat = GsmCallStat::NONE;
-        lastClccMs  = millis();
-        lastChatId  = chatId;
+        callState    = CallState::CALLING;
+        callStartMs  = millis();
+        lastGsmStat  = GsmCallStat::NONE;
+        lastClccMs   = millis();
+        lastChatId   = chatId;
+        lastCmdLabel = alias.label.length() ? alias.label : alias.command;
+        lastCmdTime  = getTimeStr();
+        displayCalling(lastCmdLabel);
     } else {
         bot->sendMessage(chatId, "Failed to dial. Check modem/SIM.", "");
     }
@@ -437,6 +465,192 @@ void initWebServer() {
 
     // Static files last — catches everything not matched above
     webServer.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+
+    // OTA firmware update — protected by admin credentials
+    ElegantOTA.setAuth("admin", cfg.adminPassword.c_str());
+    ElegantOTA.begin(&webServer);
+}
+
+// ─── NTP helpers ─────────────────────────────────────────────────────────────
+
+void initNTP() {
+    if (!WiFi.isConnected()) return;
+    configTime((long)cfg.gmtOffsetH * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.print("NTP sync");
+    struct tm t;
+    for (int i = 0; i < 20; i++) {
+        if (getLocalTime(&t, 500)) { Serial.println(" OK"); return; }
+        Serial.print(".");
+    }
+    Serial.println(" FAIL");
+}
+
+String getTimeStr() {
+    struct tm t;
+    if (!getLocalTime(&t, 50)) return "--:--";
+    char buf[6];
+    strftime(buf, sizeof(buf), "%H:%M", &t);
+    return String(buf);
+}
+
+String getDateStr() {
+    struct tm t;
+    if (!getLocalTime(&t, 50)) return "--.--.--";
+    char buf[9];
+    strftime(buf, sizeof(buf), "%d.%m.%y", &t);
+    return String(buf);
+}
+
+// ─── E-Paper display ──────────────────────────────────────────────────────────
+
+// Transliterate Cyrillic UTF-8 → ASCII; strip emojis and other non-Latin.
+String toDisplayStr(const String& s) {
+    static const char* tbl[32] = {
+        "A","B","V","G","D","E","ZH","Z","I","Y","K","L","M","N","O","P",   // А-П
+        "R","S","T","U","F","KH","TS","CH","SH","SHCH","","Y","","E","YU","YA" // Р-Я
+    };
+    String out;
+    const uint8_t* p = (const uint8_t*)s.c_str();
+    int n = s.length();
+    for (int i = 0; i < n; ) {
+        uint8_t b = p[i];
+        if (b < 0x80) { out += (char)b; i++; continue; }
+        if (i + 1 < n) {
+            uint8_t b2 = p[i + 1];
+            if (b == 0xD0) {
+                if      (b2 >= 0x90 && b2 <= 0xAF) out += tbl[b2 - 0x90];
+                else if (b2 >= 0xB0)               out += tbl[b2 - 0xB0];
+                else if (b2 == 0x84)               out += "YE";
+                else if (b2 == 0x86 || b2 == 0x87) out += "I";
+                i += 2; continue;
+            }
+            if (b == 0xD1) {
+                if      (b2 >= 0x80 && b2 <= 0x8F) out += tbl[(b2 - 0x80) + 16];
+                else if (b2 == 0x94)               out += "ye";
+                else if (b2 == 0x96 || b2 == 0x97) out += "i";
+                i += 2; continue;
+            }
+        }
+        if      (b >= 0xF0) i += 4;
+        else if (b >= 0xE0) i += 3;
+        else                i += 2;
+    }
+    return out;
+}
+
+void drawDisplay(const String& statusText, const String& subtextLine, bool useColor) {
+    int16_t tbx, tby; uint16_t tbw, tbh;
+
+    // Cache all modem/system values before entering render loop
+    int wifiBars = 0;
+    if (!apMode && WiFi.isConnected()) {
+        int rssi = WiFi.RSSI();
+        wifiBars = rssi >= -50 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : 1;
+    }
+    int csq     = modem.getSignalQuality();
+    int gsmBars = (csq == 99 || csq == 0) ? 0 : max(1, min(4, csq * 4 / 31 + 1));
+    int battPct = modem.getBattPercent();
+    String dateStr = getDateStr();
+
+    String footerRow1, footerRow2;
+    if (apMode) {
+        footerRow1 = "CallerBot-" + String((uint32_t)(ESP.getEfuseMac() >> 32), HEX);
+        footerRow2 = WiFi.softAPIP().toString();
+    } else {
+        footerRow1 = WiFi.isConnected() ? WiFi.localIP().toString() : "offline";
+        footerRow2 = lastCmdLabel.length()
+            ? "Last: " + toDisplayStr(lastCmdLabel) + " @" + lastCmdTime
+            : "No calls yet";
+    }
+
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+
+        // ── Header: WiFi bars | GSM bars | battery icon ──────────────────────
+        // Signal bars: 4 bars, baseline y=15, growing upward
+        auto drawBars = [&](int ox, int filled) {
+            for (int i = 0; i < 4; i++) {
+                int bh = (i + 1) * 3 + 1;  // 4, 7, 10, 13 px tall
+                int bx = ox + i * 7;
+                int by = 15 - bh;
+                display.fillRect(bx, by, 5, bh, GxEPD_BLACK);
+                if (i >= filled)
+                    display.fillRect(bx + 1, by + 1, 3, bh - 2, GxEPD_WHITE);
+            }
+        };
+        drawBars(2,  wifiBars);  // WiFi: x=2..28
+        drawBars(32, gsmBars);   // GSM:  x=32..58
+
+        // Battery icon: outline + nub + proportional fill
+        display.drawRect(62, 3, 22, 12, GxEPD_BLACK);   // body
+        display.fillRect(84, 6,  3,  6, GxEPD_BLACK);   // positive nub
+        if (battPct > 0) {
+            int fw = max(1, battPct * 20 / 100);
+            display.fillRect(63, 4, fw, 10, GxEPD_BLACK);
+        }
+
+        display.drawFastHLine(0, 17, 212, GxEPD_BLACK);
+
+        // ── Main status ───────────────────────────────────────────────────────
+        display.setFont(&FreeSansBold12pt7b);
+        display.setTextColor(useColor ? GxEPD_RED : GxEPD_BLACK);
+        display.getTextBounds(statusText.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+        display.setCursor((212 - tbw) / 2 - tbx, 48);
+        display.print(statusText);
+
+        // ── Subtext ───────────────────────────────────────────────────────────
+        if (subtextLine.length()) {
+            String sub = toDisplayStr(subtextLine);
+            display.setFont(&FreeSans9pt7b);
+            display.setTextColor(GxEPD_BLACK);
+            display.getTextBounds(sub.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+            display.setCursor((212 - tbw) / 2 - tbx, 65);
+            display.print(sub);
+        }
+
+        // ── Footer ────────────────────────────────────────────────────────────
+        display.drawFastHLine(0, 72, 212, GxEPD_BLACK);
+        display.setFont(nullptr);
+        display.setTextSize(1);
+        display.setTextColor(GxEPD_BLACK);
+
+        if (apMode) {
+            // AP mode: row1=SSID, row2=IP
+            display.setCursor(2, 83);
+            display.print(footerRow1);
+            display.setCursor(2, 97);
+            display.print(footerRow2);
+        } else {
+            // STA mode: row1 = date | IP, row2 = last command
+            display.setCursor(2, 83);
+            display.print(dateStr);
+            display.getTextBounds(footerRow1.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+            display.setCursor(210 - tbw, 83);
+            display.print(footerRow1);
+            display.setCursor(2, 97);
+            display.print(footerRow2);
+        }
+
+    } while (display.nextPage());
+}
+
+void displayIdle(const String& sub) {
+    drawDisplay("IDLE", sub, false);
+}
+
+void displayCalling(const String& label) {
+    drawDisplay("CALLING", label, true);
+}
+
+void initDisplay() {
+    epaperSPI.begin(EPAPER_CLK, -1, EPAPER_MOSI, EPAPER_CS);
+    display.epd2.selectSPI(epaperSPI, SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    display.init(0, true, 200, false);
+    display.setRotation(cfg.displayFlip ? 3 : 1);
+    drawDisplay("Starting...", "", false);
+    Serial.println("Display OK.");
 }
 
 // ─── Hardware init ────────────────────────────────────────────────────────────
@@ -547,13 +761,14 @@ void setup() {
     }
     loadConfig();
 
+    initDisplay();        // show "Starting..." early
     initPowerManagement();
     initModem();
     initWiFi();
+    initNTP();
 
     if (cfg.botToken.length()) {
         bot = new UniversalTelegramBot(cfg.botToken, secureClient);
-        // drain stale messages
         bot->getUpdates(bot->last_message_received + 1);
         Serial.println("Telegram bot ready.");
     } else {
@@ -567,6 +782,8 @@ void setup() {
     else
         Serial.println("Web admin: http://" + WiFi.localIP().toString());
     Serial.println("Ready.");
+
+    displayIdle();
 }
 
 void loop() {
@@ -589,7 +806,10 @@ void loop() {
         lastGsmStat = GsmCallStat::NONE;
         if (lastChatId.length() && bot)
             sendMenu(lastChatId, lastUserId, "⏱ Auto-hangup: timeout reached.");
+        displayIdle("Auto-hangup");
     }
+
+    ElegantOTA.loop();
 
     // Telegram polling (STA mode only)
     if (!apMode && bot && WiFi.isConnected() && millis() - lastPollMs >= BOT_POLL_MS) {
