@@ -11,7 +11,7 @@ Read this before touching any code. Summarises every non-obvious decision so you
 | Board | LILYGO TTGO T-Call V1.4 |
 | MCU | ESP32 (Arduino framework via PlatformIO) |
 | Modem | SIM800L — 2G only, connected via UART1 (GPIO 26/27) |
-| Power IC | IP5306 at I2C 0x75 — **must** set SYS_CTL0=0x37 at boot or SIM800L browns out on TX burst |
+| Power IC | IP5306 at I2C 0x75 — **must** set SYS_CTL0=0x37 at boot or SIM800L browns out on TX burst. Keep-alive write every 20 s prevents auto power-off on battery. |
 | Display | Waveshare 2.13" e-Paper HAT **(B)** — Black/White/Red, 104×212 px, UC8151 controller |
 
 ### GPIO conflicts (critical)
@@ -46,7 +46,23 @@ display.setRotation(cfg.displayFlip ? 3 : 1);  // 1=landscape, 3=landscape flipp
 
 Drawing coordinate system (rotation=1 or 3): width=212, height=104.
 
-Font support: FreeSans covers Latin-1 only. Use `toDisplayStr()` (line 507) to transliterate Cyrillic and strip emojis before printing user-supplied strings.
+Font support: FreeSans covers Latin-1 only. Use `toDisplayStr()` (line 531) to transliterate Cyrillic and strip emojis before printing user-supplied strings.
+
+### Header layout (Nokia 3310 pixel-art style)
+
+Status bar is 17 px tall. All values cached before `display.firstPage()` — no I2C/AT inside render loop.
+
+| Region | x | Content |
+|--------|---|---------|
+| WiFi icon | 1..7 | 5×5 px fan-arc pixel art |
+| WiFi bars | 8..22 | 4 Nokia bars (3 px wide, heights 2/4/6/8, filled=solid / empty=outline) |
+| Antenna icon | 26..30 | 5×5 px broadcast-tower pixel art |
+| GSM bars | 32..46 | same style |
+| Date | centre | DD.MM.YY — default 5×7 font |
+| Bolt | battX−11 | 6×8 px red pixel lightning bolt — shown when `ip5.charging` |
+| Battery | 190..208 | Nokia body 16×10, nub 3×6, 4 internal 2-px segments (1=25%…4=100%) |
+
+Empty bars use `GxEPD_RED` outline (not black) — intentional visual distinction.
 
 ---
 
@@ -94,6 +110,19 @@ if (!modem.init()) → powerCycleModem() → if (!modem.init()) → FATAL halt
 `powerCycleModem()`: pull PWRKEY LOW ≥1500 ms, release, wait 3000 ms for RDY sequence.
 
 Network registration waits up to 60 s, then warns and continues (non-fatal — device still works for WiFi/web even without GSM).
+
+### Modem watchdog (`loop()`)
+
+AT ping every 30 s while IDLE. Two consecutive failures → `recoverModem()`:
+- `modemSerial.begin()` (flush), `modem.init()`, optional `powerCycleModem()` if soft init fails
+- Non-fatal: logs error and retries next cycle instead of halting
+- On success: waits 15 s for network, calls `displayIdle("GSM restored")`
+
+**Why needed**: IP5306 boost can cut SIM800L power while ESP32 survives via USB. Without watchdog, device is unresponsive until physical reset.
+
+### IP5306 keep-alive (`loop()`)
+
+SYS_CTL0=0x37 re-written every 20 s (via `Wire`). IP5306 auto-shuts-off boost after ~32 s of light load on battery; periodic write resets that internal timer.
 
 ---
 
@@ -166,47 +195,72 @@ If `pio` not in PATH: `export PATH="$HOME/.platformio/penv/bin:$PATH"`
 
 ---
 
+## IP5306 battery reading
+
+`readIP5306()` at line 320 reads two registers via I2C:
+
+| Reg | Bit | Meaning |
+|-----|-----|---------|
+| 0x70 | 3 | `vinPresent` — external power connected |
+| 0x78 | 3 | `chargeFull` — charge complete |
+| 0x78 | 2 | (unused directly) |
+| 0x78 | 1:0 | `battLevel` — `(~r2) & 0x03` → 0=25%, 1=50%, 2=75%, 3=100% |
+
+`charging = vinPresent && !chargeFull`
+
+**Battery level bit inversion**: bits[1:0] of reg 0x78 are inverted (0x03=25%, 0x00=100%) on this hardware — hence `(~r2) & 0x03`. Verify on hardware if level seems backwards; fix is one-liner.
+
+Display refresh triggers only on `battLevel` change, NOT on `charging` change. Reason: `charging` flips immediately on VIN removal; a 15-20 s SPI cycle at that moment risks a brownout mid-transfer leaving BUSY stuck HIGH → infinite render loop.
+
+`lastBattLevel` and `lastCharging` seeded from real IP5306 state in `setup()` (after `initPowerManagement()`) to prevent spurious refresh at first 20 s keep-alive tick.
+
+---
+
 ## Function map (src/main.cpp)
 
 | Line | Function | Purpose |
 |------|----------|---------|
-| 85 | `loadConfig()` | read LittleFS /config.json → cfg struct |
-| 122 | `saveConfigFromJson()` | write raw JSON to LittleFS, reload cfg |
-| 132 | `isAllowedForAlias()` | per-alias auth check |
-| 146 | `tgPost()` | fresh-connection HTTPS POST to Telegram API |
-| 195 | `tickCallProgress()` | poll AT+CLCC, send progress messages |
-| 226 | `isAnyAllowed()` | true if user in any alias allow list |
-| 234 | `buildKeyboard()` | JSON inline_keyboard for sendMenu |
-| 274 | `sendMenu()` | send message + inline keyboard via tgPost |
-| 284 | `hangupCall()` | AT hangup + state reset + displayIdle |
-| 289 | `handleCall()` | dial alias, update state, displayCalling |
-| 308 | `sendStatus()` | GSM CSQ + battery → Telegram message |
-| 332 | `sendUSSD()` | send cfg.ussdCode, return response |
-| 342 | `handleMessage()` | dispatch incoming Telegram messages |
-| 426 | `checkAuth()` | HTTP Basic Auth for web routes |
-| 434 | `initWebServer()` | register all routes + ElegantOTA |
-| 476 | `initNTP()` | configTime() + wait for sync |
-| 488 | `getTimeStr()` | HH:MM from NTP |
-| 496 | `getDateStr()` | DD.MM.YY from NTP |
-| 507 | `toDisplayStr()` | Cyrillic UTF-8 → Latin + strip emojis |
-| 541 | `drawDisplay()` | full e-paper render (status, bars, battery, footer) |
-| 639 | `displayIdle()` | wrapper: drawDisplay("IDLE", ..., false) |
-| 643 | `displayCalling()` | wrapper: drawDisplay("CALLING", ..., true) |
-| 647 | `initDisplay()` | HSPI + GxEPD2 init, "Starting..." screen |
-| 658 | `initPowerManagement()` | IP5306 I2C — set SYS_CTL0=0x37 |
-| 670 | `powerCycleModem()` | PWRKEY pulse sequence |
-| 688 | `initModem()` | probe → optional power cycle → network wait |
-| 719 | `startAP()` | WiFi.softAP("CallerBot-XXXXXXXX") |
-| 728 | `initWiFi()` | STA connect 30 s → fallback startAP() |
-| 753 | `setup()` | full init sequence |
-| 789 | `loop()` | ElegantOTA + CLCC poll + auto-hangup + bot poll |
+| 90 | `loadConfig()` | read LittleFS /config.json → cfg struct |
+| 127 | `saveConfigFromJson()` | write raw JSON to LittleFS, reload cfg |
+| 137 | `isAllowedForAlias()` | per-alias auth check |
+| 151 | `tgPost()` | fresh-connection HTTPS POST to Telegram API |
+| 200 | `tickCallProgress()` | poll AT+CLCC, send progress messages |
+| 231 | `isAnyAllowed()` | true if user in any alias allow list |
+| 239 | `buildKeyboard()` | JSON inline_keyboard for sendMenu |
+| 279 | `sendMenu()` | send message + inline keyboard via tgPost |
+| 289 | `hangupCall()` | AT hangup + state reset + displayIdle |
+| 294 | `handleCall()` | dial alias, update state, displayCalling |
+| 313 | `IP5306State` | struct: battLevel, charging, chargeFull, vinPresent |
+| 320 | `readIP5306()` | read reg 0x70 + 0x78 → IP5306State |
+| 341 | `sendStatus()` | GSM CSQ + IP5306 battery → Telegram message |
+| 356 | `sendUSSD()` | send cfg.ussdCode, return response |
+| 366 | `handleMessage()` | dispatch incoming Telegram messages |
+| 450 | `checkAuth()` | HTTP Basic Auth for web routes |
+| 458 | `initWebServer()` | register all routes + ElegantOTA |
+| 500 | `initNTP()` | configTime() + wait for sync |
+| 512 | `getTimeStr()` | HH:MM from NTP |
+| 520 | `getDateStr()` | DD.MM.YY from NTP |
+| 531 | `toDisplayStr()` | Cyrillic UTF-8 → Latin + strip emojis |
+| 565 | `drawDisplay()` | full e-paper render (Nokia header, status, footer) |
+| 723 | `displayIdle()` | wrapper: drawDisplay("IDLE", ..., false) |
+| 727 | `displayCalling()` | wrapper: drawDisplay("CALLING", ..., true) |
+| 731 | `initDisplay()` | HSPI + GxEPD2 init, "Starting..." screen |
+| 742 | `initPowerManagement()` | IP5306 I2C — set SYS_CTL0=0x37 |
+| 754 | `powerCycleModem()` | PWRKEY pulse sequence |
+| 772 | `initModem()` | probe → optional power cycle → network wait (FATAL on failure) |
+| 806 | `recoverModem()` | non-fatal modem recovery for loop() watchdog |
+| 824 | `startAP()` | WiFi.softAP("CallerBot-XXXXXXXX") |
+| 833 | `initWiFi()` | STA connect 30 s → fallback startAP() |
+| 858 | `setup()` | full init sequence |
+| 899 | `loop()` | OTA + watchdog + CLCC poll + keep-alive + bot poll |
 
 ---
 
 ## Known issues / watch-outs
 
 - GSM network registration often fails (WARN after 60 s) if 2G coverage is marginal — device continues without GSM, calls don't work but web admin and WiFi do.
-- `modem.getBattPercent()` sometimes returns -1 (SIM800L doesn't always respond to AT+CBC). Battery icon shows empty but doesn't crash.
-- 3-colour e-paper refresh is slow. Only update display on call start, call end, and boot — never in polling loops.
+- 3-colour e-paper refresh is slow (15–20 s). Only update display on call start, call end, boot, and battery level change — never in polling loops.
 - AP mode: Telegram polling is disabled (bot is null in AP mode). Only web admin works.
 - `display_flip` in config requires restart to take effect (setRotation is called in initDisplay only).
+- IP5306 battery level bit mapping (`(~r2) & 0x03`) was determined empirically. If levels show inverted on hardware, change to `r2 & 0x03` in `readIP5306()`.
+- Modem watchdog adds ~1 s blocking AT call every 30 s during idle. If this causes Telegram message latency, increase the interval.
