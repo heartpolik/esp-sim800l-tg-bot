@@ -12,7 +12,8 @@
 // IP5306 power management IC (I2C address + registers)
 #define IP5306_ADDR          0x75
 #define IP5306_REG_SYS_CTL0  0x00
-#define IP5306_REG_READ2     0x78
+#define IP5306_REG_READ0     0x70   // bit3: VIN present (external power)
+#define IP5306_REG_READ2     0x78   // bit3: charge full, bit2: charging, bits[1:0]: level (0=25%…3=100%)
 
 // E-Paper display — Waveshare 2.13" (C), 212x104, 4-line SPI
 // Uses HSPI (bus 2) — VSPI MOSI GPIO 23 is taken by MODEM_POWER_ON

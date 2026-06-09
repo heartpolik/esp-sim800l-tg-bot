@@ -80,6 +80,11 @@ GxEPD2_3C<GxEPD2_213c, GxEPD2_213c::HEIGHT> display(
 String lastCmdLabel = "";
 String lastCmdTime  = "";
 
+// IP5306 battery state tracking (for display refresh on change)
+int           lastBattLevel   = -1;
+bool          lastCharging    = false;
+unsigned long lastBattCheckMs = 0;
+
 // ─── Config IO ───────────────────────────────────────────────────────────────
 
 void loadConfig() {
@@ -305,24 +310,43 @@ void handleCall(const String& chatId, const Alias& alias) {
     }
 }
 
-void sendStatus(const String& chatId) {
-    int csq = modem.getSignalQuality();
+struct IP5306State {
+    int  battLevel;   // 0=25%, 1=50%, 2=75%, 3=100% (IP5306 LED indicator bits[1:0])
+    bool charging;    // VIN present and not yet full
+    bool chargeFull;  // charge complete
+    bool vinPresent;  // external power connected
+};
+
+IP5306State readIP5306() {
+    IP5306State s = {0, false, false, false};
+
+    Wire.beginTransmission(IP5306_ADDR);
+    Wire.write(IP5306_REG_READ0);
+    Wire.endTransmission(false);
+    Wire.requestFrom(IP5306_ADDR, 1);
+    uint8_t r0 = Wire.available() ? Wire.read() : 0;
+    s.vinPresent = (r0 >> 3) & 0x01;
 
     Wire.beginTransmission(IP5306_ADDR);
     Wire.write(IP5306_REG_READ2);
     Wire.endTransmission(false);
     Wire.requestFrom(IP5306_ADDR, 1);
-    uint8_t reg = Wire.available() ? Wire.read() : 0;
-    bool charging = (reg >> 3) & 0x01;
-    bool full     = (reg >> 2) & 0x01;
+    uint8_t r2 = Wire.available() ? Wire.read() : 0;
+    s.chargeFull = (r2 >> 3) & 0x01;
+    s.charging   = s.vinPresent && !s.chargeFull;
+    s.battLevel  = (~r2) & 0x03;  // 0=25%, 1=50%, 2=75%, 3=100%
+    return s;
+}
 
-    int battPct = modem.getBattPercent();
+void sendStatus(const String& chatId) {
+    int csq = modem.getSignalQuality();
+    IP5306State ip5 = readIP5306();
 
+    int pct = (ip5.battLevel + 1) * 25;
     String msg = "📶 Signal: " + String(csq) + "/31\n";
-    if (battPct >= 0) msg += "🔋 Battery: " + String(battPct) + "%";
-    else              msg += "🔋 Battery: n/a";
-    if (charging) msg += " ⚡";
-    else if (full) msg += " ✅";
+    msg += "🔋 Battery: " + String(pct) + "%";
+    if (ip5.chargeFull)    msg += " ✅ full";
+    else if (ip5.charging) msg += " ⚡";
     msg += "\n📞 Call: ";
     msg += (callState == CallState::IDLE) ? "idle" : "active";
 
@@ -549,8 +573,8 @@ void drawDisplay(const String& statusText, const String& subtextLine, bool useCo
     }
     int csq     = modem.getSignalQuality();
     int gsmBars = (csq == 99 || csq == 0) ? 0 : max(1, min(4, csq * 4 / 31 + 1));
-    int battPct = modem.getBattPercent();
-    String dateStr = getDateStr();
+    IP5306State ip5 = readIP5306();
+    String dateStr  = getDateStr();
 
     String footerRow1, footerRow2;
     if (apMode) {
@@ -568,30 +592,93 @@ void drawDisplay(const String& statusText, const String& subtextLine, bool useCo
     do {
         display.fillScreen(GxEPD_WHITE);
 
-        // ── Header: WiFi bars | GSM bars | battery icon ──────────────────────
-        // Signal bars: 4 bars, baseline y=15, growing upward
-        auto drawBars = [&](int ox, int filled) {
+        // ── Header: Nokia 3310–style pixel art ───────────────────────────────
+        // Signal bars: 4 bars, 3 px wide, heights 2/4/6/8 px, 1 px gap, baseline y=9
+        // Filled bar = solid black; empty bar = outline only (classic Nokia look)
+        auto drawNokiaBars = [&](int ox, int filled) {
             for (int i = 0; i < 4; i++) {
-                int bh = (i + 1) * 3 + 1;  // 4, 7, 10, 13 px tall
-                int bx = ox + i * 7;
-                int by = 15 - bh;
-                display.fillRect(bx, by, 5, bh, GxEPD_BLACK);
-                if (i >= filled)
-                    display.fillRect(bx + 1, by + 1, 3, bh - 2, GxEPD_WHITE);
+                int bh   = (i + 1) * 2;
+                int barX = ox + i * 4;
+                int barY = 10 - bh;
+                if (i < filled)
+                    display.fillRect(barX, barY, 3, bh, GxEPD_BLACK);
+                else
+                    display.drawRect(barX, barY, 3, bh, GxEPD_RED);
             }
         };
-        drawBars(2,  wifiBars);  // WiFi: x=2..28
-        drawBars(32, gsmBars);   // GSM:  x=32..58
+        // WiFi icon (5×5 px): outer arc → inner arc → dot
+        // #  #  #   y=2
+        //  # # #   y=3
+        //   ###    y=4
+        //    #     y=5
+        //    #     y=6
+        // display.drawFastHLine(2, 2, 5, GxEPD_BLACK);
+        display.drawPixel(1, 2, GxEPD_BLACK);
+        display.drawPixel(4, 2, GxEPD_BLACK);
+        display.drawPixel(7, 2, GxEPD_BLACK);
+        display.drawPixel(2, 3, GxEPD_BLACK);
+        display.drawPixel(4, 3, GxEPD_BLACK);
+        display.drawPixel(6, 3, GxEPD_BLACK);
+        display.drawFastHLine(3, 4, 3, GxEPD_BLACK);
+        display.drawPixel(4, 5, GxEPD_BLACK);
+        display.drawPixel(4, 6, GxEPD_BLACK);
+        drawNokiaBars(8, gsmBars);   // WiFi bars: x=8..22
 
-        // Battery icon: outline + nub + proportional fill
-        display.drawRect(62, 3, 22, 12, GxEPD_BLACK);   // body
-        display.fillRect(84, 6,  3,  6, GxEPD_BLACK);   // positive nub
-        if (battPct > 0) {
-            int fw = max(1, battPct * 20 / 100);
-            display.fillRect(63, 4, fw, 10, GxEPD_BLACK);
+        // Antenna icon (5×5 px): broadcast tower silhouette
+        //    #     y=2
+        //   # #    y=3
+        //  #   #   y=4
+        //    #     y=5
+        //   ###    y=6
+        display.drawPixel(28, 2, GxEPD_BLACK);
+        display.drawPixel(27, 3, GxEPD_BLACK);
+        display.drawPixel(29, 3, GxEPD_BLACK);
+        display.drawPixel(26, 4, GxEPD_BLACK);
+        display.drawPixel(30, 4, GxEPD_BLACK);
+        display.drawPixel(28, 5, GxEPD_BLACK);
+        display.drawFastHLine(27, 6, 3, GxEPD_BLACK);
+        drawNokiaBars(32, wifiBars);   // GSM bars: x=32..46
+
+        // Date in centre of status bar (Nokia feel)
+        display.setFont(nullptr);
+        display.setTextSize(1);
+        display.setTextColor(GxEPD_BLACK);
+        {
+            int16_t tx, ty; uint16_t tw, th;
+            display.getTextBounds(footerRow1.c_str(), 0, 0, &tx, &ty, &tw, &th);
+            display.setCursor((212 - tw) / 2 - tx, 3);
+            display.print(footerRow1);
         }
 
-        display.drawFastHLine(0, 17, 212, GxEPD_BLACK);
+        // Nokia battery: body 16×10, positive nub 3×6, 4 internal 2-px segments
+        // Segments fill left→right: 1 segment = 25%, 4 = 100%
+        const int battX = 190, battY = 1;
+        display.drawRect(battX,      battY,     16, 10, GxEPD_BLACK);  // body outline
+        display.fillRect(battX + 16, battY + 2,  3,  6, GxEPD_BLACK);  // positive nub
+        for (int i = 0; i < ip5.battLevel + 1; i++) {
+            display.fillRect(battX + 2 + i * 3, battY + 2, 2, 6, GxEPD_BLACK);
+        }
+
+        // Charging: 6x8 px red pixel lightning bolt, left of battery
+        if (ip5.charging) {
+            const int lx = battX - 11, ly = battY + 1;
+            //  ....##
+            //  ...##
+            //  ..##
+            //  .#####
+            //  #####
+            //  ..##
+            //  .##
+            //  ##
+            display.drawFastHLine(lx + 4, ly,     2, GxEPD_RED);
+            display.drawFastHLine(lx + 3, ly + 1, 2, GxEPD_RED);
+            display.drawFastHLine(lx + 2, ly + 2, 2, GxEPD_RED);
+            display.drawFastHLine(lx + 1, ly + 3, 5, GxEPD_RED);
+            display.drawFastHLine(lx,     ly + 4, 5, GxEPD_RED);
+            display.drawFastHLine(lx + 2, ly + 5, 2, GxEPD_RED);
+            display.drawFastHLine(lx + 1, ly + 6, 2, GxEPD_RED);
+            display.drawFastHLine(lx,     ly + 7, 2, GxEPD_RED);
+        }
 
         // ── Main status ───────────────────────────────────────────────────────
         display.setFont(&FreeSansBold12pt7b);
@@ -611,7 +698,7 @@ void drawDisplay(const String& statusText, const String& subtextLine, bool useCo
         }
 
         // ── Footer ────────────────────────────────────────────────────────────
-        display.drawFastHLine(0, 72, 212, GxEPD_BLACK);
+        // display.drawFastHLine(0, 72, 212, GxEPD_BLACK);
         display.setFont(nullptr);
         display.setTextSize(1);
         display.setTextColor(GxEPD_BLACK);
@@ -624,12 +711,9 @@ void drawDisplay(const String& statusText, const String& subtextLine, bool useCo
             display.print(footerRow2);
         } else {
             // STA mode: row1 = date | IP, row2 = last command
-            display.setCursor(2, 83);
+            display.setCursor(2, 14);
             display.print(dateStr);
-            display.getTextBounds(footerRow1.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
-            display.setCursor(210 - tbw, 83);
-            display.print(footerRow1);
-            display.setCursor(2, 97);
+            display.setCursor(2, 92);
             display.print(footerRow2);
         }
 
@@ -716,6 +800,27 @@ void initModem() {
         csq == 99 ? "unknown" : csq < 10 ? "poor" : csq < 20 ? "fair" : "good");
 }
 
+// Non-fatal modem recovery for use from loop() (unlike initModem which halts on failure).
+// Called when watchdog detects modem is unresponsive (e.g. SIM800L lost power while
+// ESP32 stayed alive via USB, then VIN was reconnected without an ESP32 reset).
+void recoverModem() {
+    Serial.println("Modem watchdog: recovery start");
+    modemSerial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    delay(100);
+    if (!modem.init()) {
+        Serial.println("Modem watchdog: soft init failed — power cycling");
+        powerCycleModem();
+        if (!modem.init()) {
+            Serial.println("ERROR: modem recovery failed — will retry next cycle");
+            return;
+        }
+    }
+    for (int i = 0; i < 15 && !modem.isNetworkConnected(); i++)
+        delay(1000);
+    Serial.printf("Modem recovery OK, CSQ=%d\n", modem.getSignalQuality());
+    displayIdle("GSM restored");
+}
+
 void startAP() {
     apMode = true;
     // SSID unique per chip, no password — open network for initial setup
@@ -763,6 +868,11 @@ void setup() {
 
     initDisplay();        // show "Starting..." early
     initPowerManagement();
+    {   // seed battery state so first keep-alive check doesn't trigger false display refresh
+        IP5306State ip5 = readIP5306();
+        lastBattLevel = ip5.battLevel;
+        lastCharging  = ip5.charging;
+    }
     initModem();
     initWiFi();
     initNTP();
@@ -810,6 +920,49 @@ void loop() {
     }
 
     ElegantOTA.loop();
+
+    // Modem watchdog: AT ping every 30 s when idle.
+    // Catches silent SIM800L crash (e.g. VIN removed → SIM800L power lost while ESP32
+    // survived via USB → VIN reconnected but ESP32 never rebooted → modem unresponsive).
+    if (callState == CallState::IDLE) {
+        static unsigned long lastModemCheckMs = 0;
+        static int modemFailCount = 0;
+        if (millis() - lastModemCheckMs >= 30000UL) {
+            lastModemCheckMs = millis();
+            modem.sendAT(GF(""));
+            if (modem.waitResponse(1000) != 1) {
+                Serial.printf("WARN: modem AT ping failed (%d/2)\n", ++modemFailCount);
+                if (modemFailCount >= 2) {
+                    modemFailCount = 0;
+                    recoverModem();
+                }
+            } else {
+                modemFailCount = 0;
+            }
+        }
+    }
+
+    // IP5306 keep-alive every 20 s: re-write SYS_CTL0 to prevent auto power-off on battery.
+    // IP5306 shuts down boost after ~32 s of light load when VIN is absent; periodic write resets
+    // that timer even if the load dips momentarily (e.g. during WiFi TX idle or sleep).
+    if (millis() - lastBattCheckMs >= 20000UL) {
+        lastBattCheckMs = millis();
+        Wire.beginTransmission(IP5306_ADDR);
+        Wire.write(IP5306_REG_SYS_CTL0);
+        Wire.write(0x37);
+        Wire.endTransmission();
+        // Battery level change → refresh display (charging-state change does NOT refresh —
+        // avoids a 15-20 s e-paper cycle triggered right when VIN is removed, which risks
+        // a brownout mid-SPI leaving BUSY stuck HIGH and the render loop spinning forever).
+        if (callState == CallState::IDLE) {
+            IP5306State ip5 = readIP5306();
+            lastCharging = ip5.charging;
+            if (ip5.battLevel != lastBattLevel) {
+                lastBattLevel = ip5.battLevel;
+                displayIdle("");
+            }
+        }
+    }
 
     // Telegram polling (STA mode only)
     if (!apMode && bot && WiFi.isConnected() && millis() - lastPollMs >= BOT_POLL_MS) {
