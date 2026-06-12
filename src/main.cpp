@@ -3,6 +3,8 @@
 
 #include "config.h"
 #include <Arduino.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -72,6 +74,7 @@ String        lastChatId  = "";
 long          lastUserId  = 0;
 
 unsigned long lastPollMs    = 0;
+long          bootTimeUnix  = 0;   // Unix time recorded after NTP; stale-message filter
 unsigned long lastClccMs    = 0;
 const unsigned long CLCC_INTERVAL_MS = 4000UL;
 
@@ -1160,6 +1163,10 @@ void initWiFi() {
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 
 void setup() {
+    // IP5306 regulates VOUT; ESP32 brownout detector fires on USB→battery transition
+    // (brief voltage dip during switchover). Disable it — IP5306 handles undervoltage.
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
     Serial.begin(115200);
     delay(500);
     Serial.println("\n=== ESP32 Caller Bot ===");
@@ -1186,6 +1193,7 @@ void setup() {
     initModem();
     initWiFi();
     initNTP();
+    bootTimeUnix = time(nullptr);  // used to skip stale Telegram callbacks after reboot
 
     if (cfg.botToken.length()) {
         bot = new UniversalTelegramBot(cfg.botToken, secureClient);
@@ -1287,6 +1295,16 @@ void loop() {
         int numMsg = bot->getUpdates(bot->last_message_received + 1);
         if (numMsg > 0) Serial.printf("Bot: %d message(s)\n", numMsg);
         for (int i = 0; i < numMsg; i++) {
+            // Skip messages that predate this boot — stale callbacks replayed after
+            // an unexpected reboot (e.g. brownout) would otherwise be processed twice.
+            long msgDate = bot->messages[i].date.toInt();
+            if (bootTimeUnix > 0 && msgDate > 0 && msgDate < bootTimeUnix - 60) {
+                Serial.printf("  skip stale [%s] date=%ld boot=%ld\n",
+                    bot->messages[i].text.c_str(), msgDate, bootTimeUnix);
+                if (bot->messages[i].type == "callback_query")
+                    bot->answerCallbackQuery(bot->messages[i].query_id, "");
+                continue;
+            }
             Serial.printf("  [%s] from:%s text:%s\n",
                 bot->messages[i].type.c_str(),
                 bot->messages[i].from_id.c_str(),
