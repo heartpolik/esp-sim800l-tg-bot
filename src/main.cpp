@@ -22,6 +22,13 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 
+// UC8151 3-colour full refresh takes 15-20 s; default busy_timeout is 20 s
+// which is too tight. Override via subclass (protected field, can't set externally).
+struct GxEPD2_213c_30s : public GxEPD2_213c {
+    GxEPD2_213c_30s(int16_t cs, int16_t dc, int16_t rst, int16_t busy)
+        : GxEPD2_213c(cs, dc, rst, busy) { _busy_timeout = 40000000; }
+};
+
 // ─── Config structs ───────────────────────────────────────────────────────────
 
 struct Alias {
@@ -36,6 +43,7 @@ struct AppConfig {
     String wifiPassword;
     String botToken;
     String adminPassword;
+    long   adminUserId  = 0;
     String ussdCode;
     unsigned long callTimeoutMs = CALL_TIMEOUT_MS;
     int gmtOffsetH = 2;
@@ -70,15 +78,48 @@ const unsigned long CLCC_INTERVAL_MS = 4000UL;
 bool          shouldRestart  = false;
 unsigned long restartAfterMs = 0;
 bool          apMode         = false;
+bool          displayOk      = false;
+bool          modemOk        = false;
+
+struct BalanceInfo {
+    String minutes;  // "15" (parsed from "15hv")
+    String nextPay;  // "04.09.26" (after "poslug ")
+    String expiry;   // "12.06.27" (after "diye do ")
+};
+static BalanceInfo lastBalance;
+
+// Display task (Core 0) — all SPI render work runs here so Core 1 never blocks
+struct DisplaySnapshot {
+    String statusText;
+    String subtextLine;  // pre-transliterated via toDisplayStr()
+    bool   useColor;
+    int    wifiBars;
+    int    gsmBars;
+    int    battLevel;
+    bool   charging;
+    String dateStr;
+    String footerRow1;
+    String footerRow2;
+    String operatorName;
+    bool   apModeSnap;
+    // Parsed USSD balance fields (empty until first balance query)
+    String balMinutes;
+    String balNextPay;
+    String balExpiry;
+};
+static DisplaySnapshot   pendingSnap;
+static SemaphoreHandle_t snapMutex  = nullptr;  // protects pendingSnap
+static SemaphoreHandle_t snapSignal = nullptr;  // binary: "render requested"
 
 // E-Paper display (HSPI — avoids GPIO 23 conflict with MODEM_POWER_ON)
 SPIClass epaperSPI(HSPI);
-GxEPD2_3C<GxEPD2_213c, GxEPD2_213c::HEIGHT> display(
-    GxEPD2_213c(EPAPER_CS, EPAPER_DC, EPAPER_RST, EPAPER_BUSY));
+GxEPD2_3C<GxEPD2_213c_30s, GxEPD2_213c_30s::HEIGHT> display(
+    GxEPD2_213c_30s(EPAPER_CS, EPAPER_DC, EPAPER_RST, EPAPER_BUSY));
 
 // Last-call tracking
 String lastCmdLabel = "";
 String lastCmdTime  = "";
+String lastCmdUser  = "";
 
 // IP5306 battery state tracking (for display refresh on change)
 int           lastBattLevel   = -1;
@@ -105,6 +146,7 @@ void loadConfig() {
     cfg.wifiPassword   = doc["wifi_password"]    | "";
     cfg.botToken       = doc["bot_token"]        | "";
     cfg.adminPassword  = doc["admin_password"]   | "admin";
+    cfg.adminUserId    = doc["admin_user_id"]    | 0;
     cfg.ussdCode       = doc["ussd_code"]        | "";
     int timeoutSec     = doc["call_timeout_s"]   | 0;
     cfg.callTimeoutMs  = timeoutSec > 0 ? (unsigned long)timeoutSec * 1000 : CALL_TIMEOUT_MS;
@@ -234,6 +276,10 @@ bool isAnyAllowed(long userId) {
     return false;
 }
 
+bool isAdmin(long userId) {
+    return cfg.adminUserId != 0 && userId == cfg.adminUserId;
+}
+
 // ─── Keyboard builder ─────────────────────────────────────────────────────────
 
 String buildKeyboard(long userId) {
@@ -260,15 +306,28 @@ String buildKeyboard(long userId) {
         btn["callback_data"] = "hangup";
     }
 
-    // Status + Echo row
-    JsonArray actionRow = rows.createNestedArray();
-    JsonObject statusBtn = actionRow.createNestedObject();
-    statusBtn["text"]          = "📊 Status";
-    statusBtn["callback_data"] = "status";
-    if (cfg.ussdCode.length()) {
-        JsonObject echoBtn = actionRow.createNestedObject();
-        echoBtn["text"]          = "💵 Balance";
-        echoBtn["callback_data"] = "echo";
+    // Admin-only row: Status, Balance, Reboot
+    if (isAdmin(userId)) {
+        JsonArray adminRow = rows.createNestedArray();
+        JsonObject statusBtn = adminRow.createNestedObject();
+        statusBtn["text"]          = "📊 Status";
+        statusBtn["callback_data"] = "status";
+        if (cfg.ussdCode.length()) {
+            JsonObject echoBtn = adminRow.createNestedObject();
+            echoBtn["text"]          = "💵 Balance";
+            echoBtn["callback_data"] = "echo";
+        }
+        JsonObject rebootBtn = adminRow.createNestedObject();
+        rebootBtn["text"]          = "🔄 Reboot";
+        rebootBtn["callback_data"] = "reboot";
+    }
+
+    // My ID row — visible to everyone
+    {
+        JsonArray idRow = rows.createNestedArray();
+        JsonObject idBtn = idRow.createNestedObject();
+        idBtn["text"]          = "🪪 My ID";
+        idBtn["callback_data"] = "getmyid";
     }
 
     String out;
@@ -292,11 +351,20 @@ void hangupCall(const String& chatId) {
 }
 
 void handleCall(const String& chatId, const Alias& alias) {
+    Serial.printf("[handleCall] phone=%s state=%d modemOk=%d\n",
+        alias.phone.c_str(), (int)callState, (int)modemOk);
     if (callState != CallState::IDLE) {
         bot->sendMessage(chatId, "Call already in progress.", "");
         return;
     }
-    if (modem.callNumber(alias.phone.c_str())) {
+    if (!modem.isNetworkConnected()) {
+        bot->sendMessage(chatId, "❌ GSM not registered. Check SIM/antenna.", "");
+        return;
+    }
+    bool dialOk = modem.callNumber(alias.phone.c_str());
+    Serial.printf("[handleCall] callNumber=%d registered=%d\n",
+        (int)dialOk, (int)modem.isNetworkConnected());
+    if (dialOk) {
         callState    = CallState::CALLING;
         callStartMs  = millis();
         lastGsmStat  = GsmCallStat::NONE;
@@ -306,6 +374,7 @@ void handleCall(const String& chatId, const Alias& alias) {
         lastCmdTime  = getTimeStr();
         displayCalling(lastCmdLabel);
     } else {
+        Serial.println("[handleCall] dial FAILED — not registered or modem error");
         bot->sendMessage(chatId, "Failed to dial. Check modem/SIM.", "");
     }
 }
@@ -353,14 +422,97 @@ void sendStatus(const String& chatId) {
     bot->sendMessage(chatId, msg, "");
 }
 
+static BalanceInfo parseBalance(const String& s) {
+    BalanceInfo b;
+    // Minutes: digits immediately before "hv" (e.g. "15hv")
+    int hv = s.indexOf("hv");
+    if (hv > 0) {
+        int start = hv;
+        while (start > 0 && isdigit(s[start - 1])) start--;
+        if (start < hv) b.minutes = s.substring(start, hv);
+    }
+    // Next payment date: DD.MM only (5 chars after "poslug ") — year dropped to save display space
+    int ps = s.indexOf("poslug ");
+    if (ps >= 0 && ps + 12 <= (int)s.length())
+        b.nextPay = s.substring(ps + 7, ps + 12);
+    // SIM expiry date: 8 chars after "diye do "
+    int dy = s.indexOf("diye do ");
+    if (dy >= 0 && dy + 16 <= (int)s.length())
+        b.expiry = s.substring(dy + 8, dy + 16);
+    return b;
+}
+
+// TinyGSM's sendUSSD fails on SIM800 when +CUSD: arrives before OK (some firmware
+// versions send them in that order), because waitResponse() consumes +CUSD: while
+// looking for OK, leaving the second waitResponse() with nothing.
+// Fix: send AT+CUSD raw and capture all output for up to 15 s, then parse manually.
+static String ussdRaw(const String& code) {
+    // Flush pending input
+    while (modemSerial.available()) modemSerial.read();
+
+    modem.sendAT(GF("+CUSD=1,\""), code.c_str(), GF("\""));
+
+    String raw;
+    unsigned long t = millis();
+    while (millis() - t < 15000) {
+        while (modemSerial.available()) {
+            raw += (char)modemSerial.read();
+            t = millis();
+        }
+        if (raw.indexOf("ERROR") >= 0) break;
+        if (raw.indexOf("+CUSD:") >= 0 &&
+            (raw.indexOf("OK") >= 0 || raw.indexOf("\n", raw.indexOf("+CUSD:") + 6) >= 0))
+            break;
+        delay(5);
+    }
+    Serial.println("[USSD raw] " + raw);
+
+    int cusd = raw.indexOf("+CUSD:");
+    if (cusd < 0) return "";
+    int q1 = raw.indexOf('"', cusd);
+    if (q1 < 0) return "";
+    int q2 = raw.indexOf('"', q1 + 1);
+    if (q2 < 0) return "";
+    String msg = raw.substring(q1 + 1, q2);
+
+    int dcsComma = raw.indexOf(',', q2);
+    int dcs = (dcsComma >= 0) ? raw.substring(dcsComma + 1).toInt() : -1;
+
+    // DCS=72 → UCS2 hex; decode to UTF-8
+    if (dcs == 72 && msg.length() % 4 == 0) {
+        String out;
+        for (int i = 0; i < (int)msg.length(); i += 4) {
+            uint16_t cp = (uint16_t)strtol(msg.substring(i, i + 4).c_str(), nullptr, 16);
+            if      (cp < 0x80)  { out += (char)cp; }
+            else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6));
+                                   out += (char)(0x80 | (cp & 0x3F)); }
+            else                 { out += (char)(0xE0 | (cp >> 12));
+                                   out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                                   out += (char)(0x80 | (cp & 0x3F)); }
+        }
+        return out;
+    }
+    return msg;
+}
+
 void sendUSSD(const String& chatId) {
     if (!cfg.ussdCode.length()) {
         bot->sendMessage(chatId, "USSD code not set. Configure via web admin.", "");
         return;
     }
+    bool reg = modem.isNetworkConnected();
+    Serial.printf("[USSD] registered=%d code=%s\n", (int)reg, cfg.ussdCode.c_str());
+    if (!reg) {
+        bot->sendMessage(chatId, "❌ GSM not registered. Check SIM/antenna.", "");
+        return;
+    }
     bot->sendMessage(chatId, "⏳ Sending USSD " + cfg.ussdCode + "...", "");
-    String response = modem.sendUSSD(cfg.ussdCode);
+    String response = ussdRaw(cfg.ussdCode);
     bot->sendMessage(chatId, response.length() ? response : "No response from operator.", "");
+    if (response.length() && callState == CallState::IDLE) {
+        lastBalance = parseBalance(response);
+        displayIdle("");
+    }
 }
 
 void handleMessage(const telegramMessage& msg) {
@@ -384,7 +536,7 @@ void handleMessage(const telegramMessage& msg) {
         return;
     }
 
-    if (input == "/getMyId") {
+    if (input == "/getMyId" || input == "getmyid") {
         bot->sendMessage(msg.chat_id,
             "Your Telegram ID: " + msg.from_id + "\n"
             "Name: " + msg.from_name, "");
@@ -393,20 +545,33 @@ void handleMessage(const telegramMessage& msg) {
     }
 
     if (!isAnyAllowed(userId)) {
+        Serial.printf("[auth] DENIED userId=%ld aliases=%d\n", userId, (int)cfg.aliases.size());
         answerCb("Unauthorized");
         if (!isCallback) bot->sendMessage(msg.chat_id, "Unauthorized.", "");
         return;
     }
+    Serial.printf("[auth] OK userId=%ld\n", userId);
 
     if (input == "/status" || input == "status") {
+        if (!isAdmin(userId)) { answerCb("Unauthorized"); return; }
         sendStatus(msg.chat_id);
         answerCb();
         return;
     }
 
     if (input == "/echo" || input == "echo") {
+        if (!isAdmin(userId)) { answerCb("Unauthorized"); return; }
         sendUSSD(msg.chat_id);
         answerCb();
+        return;
+    }
+
+    if (input == "/reboot" || input == "reboot") {
+        if (!isAdmin(userId)) { answerCb("Unauthorized"); return; }
+        answerCb("Rebooting...");
+        bot->sendMessage(msg.chat_id, "🔄 Rebooting...", "");
+        delay(500);
+        ESP.restart();
         return;
     }
 
@@ -423,13 +588,16 @@ void handleMessage(const telegramMessage& msg) {
     else if (input.startsWith("/")) target = input.substring(1);
 
     if (target.length()) {
+        Serial.printf("[call] target=%s aliases=%d\n", target.c_str(), (int)cfg.aliases.size());
         for (const auto& alias : cfg.aliases) {
             if (alias.command == target) {
                 if (!isAllowedForAlias(userId, alias)) {
+                    Serial.printf("[call] alias found but userId=%ld not in allowedUsers\n", userId);
                     answerCb("Unauthorized");
                     if (!isCallback) bot->sendMessage(msg.chat_id, "Unauthorized for this command.", "");
                 } else {
-                    lastUserId = userId;
+                    lastUserId  = userId;
+                    lastCmdUser = msg.from_name;
                     handleCall(msg.chat_id, alias);
                     if (callState == CallState::CALLING) {
                         answerCb("Dialling...");
@@ -562,39 +730,25 @@ String toDisplayStr(const String& s) {
     return out;
 }
 
-void drawDisplay(const String& statusText, const String& subtextLine, bool useColor) {
+// Render loop — runs on Core 0 display task only. All values pre-cached in snap.
+// Layout:
+//   Row 1 (y=0-10):  [GSM icon][GSM bars] · [operator] · [WiFi icon][WiFi bars][IP]
+//   Row 2 (y=12-22): [date] [⏱min] [📅DD.MM] [💾DD.MM.YY] [Nokia battery]
+//   Body  (y=24-85): status text + subtext
+//   Footer (y=95):   last call
+static void renderSnapshot(const DisplaySnapshot& s) {
     int16_t tbx, tby; uint16_t tbw, tbh;
-
-    // Cache all modem/system values before entering render loop
-    int wifiBars = 0;
-    if (!apMode && WiFi.isConnected()) {
-        int rssi = WiFi.RSSI();
-        wifiBars = rssi >= -50 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : 1;
-    }
-    int csq     = modem.getSignalQuality();
-    int gsmBars = (csq == 99 || csq == 0) ? 0 : max(1, min(4, csq * 4 / 31 + 1));
-    IP5306State ip5 = readIP5306();
-    String dateStr  = getDateStr();
-
-    String footerRow1, footerRow2;
-    if (apMode) {
-        footerRow1 = "CallerBot-" + String((uint32_t)(ESP.getEfuseMac() >> 32), HEX);
-        footerRow2 = WiFi.softAPIP().toString();
-    } else {
-        footerRow1 = WiFi.isConnected() ? WiFi.localIP().toString() : "offline";
-        footerRow2 = lastCmdLabel.length()
-            ? "Last: " + toDisplayStr(lastCmdLabel) + " @" + lastCmdTime
-            : "No calls yet";
-    }
 
     display.setFullWindow();
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
 
-        // ── Header: Nokia 3310–style pixel art ───────────────────────────────
-        // Signal bars: 4 bars, 3 px wide, heights 2/4/6/8 px, 1 px gap, baseline y=9
-        // Filled bar = solid black; empty bar = outline only (classic Nokia look)
+        display.setFont(nullptr);
+        display.setTextSize(1);
+        display.setTextColor(GxEPD_BLACK);
+
+        // Nokia-style 4-bar signal indicator (shared for GSM and WiFi)
         auto drawNokiaBars = [&](int ox, int filled) {
             for (int i = 0; i < 4; i++) {
                 int bh   = (i + 1) * 2;
@@ -606,118 +760,239 @@ void drawDisplay(const String& statusText, const String& subtextLine, bool useCo
                     display.drawRect(barX, barY, 3, bh, GxEPD_RED);
             }
         };
-        // WiFi icon (5×5 px): outer arc → inner arc → dot
-        // #  #  #   y=2
-        //  # # #   y=3
-        //   ###    y=4
-        //    #     y=5
-        //    #     y=6
-        // display.drawFastHLine(2, 2, 5, GxEPD_BLACK);
-        display.drawPixel(1, 2, GxEPD_BLACK);
-        display.drawPixel(4, 2, GxEPD_BLACK);
-        display.drawPixel(7, 2, GxEPD_BLACK);
-        display.drawPixel(2, 3, GxEPD_BLACK);
-        display.drawPixel(4, 3, GxEPD_BLACK);
-        display.drawPixel(6, 3, GxEPD_BLACK);
-        display.drawFastHLine(3, 4, 3, GxEPD_BLACK);
-        display.drawPixel(4, 5, GxEPD_BLACK);
-        display.drawPixel(4, 6, GxEPD_BLACK);
-        drawNokiaBars(8, gsmBars);   // WiFi bars: x=8..22
 
-        // Antenna icon (5×5 px): broadcast tower silhouette
-        //    #     y=2
-        //   # #    y=3
-        //  #   #   y=4
-        //    #     y=5
-        //   ###    y=6
-        display.drawPixel(28, 2, GxEPD_BLACK);
-        display.drawPixel(27, 3, GxEPD_BLACK);
-        display.drawPixel(29, 3, GxEPD_BLACK);
-        display.drawPixel(26, 4, GxEPD_BLACK);
-        display.drawPixel(30, 4, GxEPD_BLACK);
-        display.drawPixel(28, 5, GxEPD_BLACK);
-        display.drawFastHLine(27, 6, 3, GxEPD_BLACK);
-        drawNokiaBars(32, wifiBars);   // GSM bars: x=32..46
+        // WiFibroadcast-tower icon (5×5, top-left at (bx, 2))
+        auto drawWiFiIcon = [&](int bx) {
+            display.drawPixel(bx+2, 2, GxEPD_BLACK);
+            display.drawPixel(bx+1, 3, GxEPD_BLACK);
+            display.drawPixel(bx+3, 3, GxEPD_BLACK);
+            display.drawPixel(bx,   4, GxEPD_BLACK);
+            display.drawPixel(bx+4, 4, GxEPD_BLACK);
+            display.drawPixel(bx+2, 5, GxEPD_BLACK);
+            display.drawFastHLine(bx+1, 6, 3, GxEPD_BLACK);
+        };
 
-        // Date in centre of status bar (Nokia feel)
-        display.setFont(nullptr);
-        display.setTextSize(1);
-        display.setTextColor(GxEPD_BLACK);
-        {
-            int16_t tx, ty; uint16_t tw, th;
-            display.getTextBounds(footerRow1.c_str(), 0, 0, &tx, &ty, &tw, &th);
-            display.setCursor((212 - tw) / 2 - tx, 3);
-            display.print(footerRow1);
+        // GSM  fan-arc icon (7×5, top-left at (bx, 2)) — same pixel art as before
+        auto drawGSMIcon = [&](int bx) {
+            display.drawPixel(bx,   2, GxEPD_BLACK);
+            display.drawPixel(bx+3, 2, GxEPD_BLACK);
+            display.drawPixel(bx+6, 2, GxEPD_BLACK);
+            display.drawPixel(bx+1, 3, GxEPD_BLACK);
+            display.drawPixel(bx+3, 3, GxEPD_BLACK);
+            display.drawPixel(bx+5, 3, GxEPD_BLACK);
+            display.drawFastHLine(bx+2, 4, 3, GxEPD_BLACK);
+            display.drawPixel(bx+3, 5, GxEPD_BLACK);
+            display.drawPixel(bx+3, 6, GxEPD_BLACK);
+        };
+
+        // Balance icons (5×5, oy = top y)
+        auto drawClockIcon = [&](int ox, int oy) {
+            display.drawFastHLine(ox+1, oy,   3, GxEPD_BLACK);
+            display.drawPixel(ox,   oy+1, GxEPD_BLACK);
+            display.drawPixel(ox+4, oy+1, GxEPD_BLACK);
+            display.drawPixel(ox,   oy+2, GxEPD_BLACK);
+            display.drawPixel(ox+2, oy+2, GxEPD_BLACK);
+            display.drawPixel(ox+3, oy+2, GxEPD_BLACK);
+            display.drawPixel(ox,   oy+3, GxEPD_BLACK);
+            display.drawPixel(ox+4, oy+3, GxEPD_BLACK);
+            display.drawFastHLine(ox+1, oy+4, 3, GxEPD_BLACK);
+        };
+        auto drawCalendarIcon = [&](int ox, int oy) {
+            display.drawPixel(ox,   oy,   GxEPD_BLACK);
+            display.drawPixel(ox+2, oy,   GxEPD_BLACK);
+            display.drawPixel(ox+4, oy,   GxEPD_BLACK);
+            display.drawFastHLine(ox, oy+1, 5, GxEPD_BLACK);
+            display.drawPixel(ox,   oy+2, GxEPD_BLACK);
+            display.drawPixel(ox+2, oy+2, GxEPD_BLACK);
+            display.drawPixel(ox+4, oy+2, GxEPD_BLACK);
+            display.drawFastHLine(ox, oy+3, 5, GxEPD_BLACK);
+            display.drawPixel(ox,   oy+4, GxEPD_BLACK);
+            display.drawPixel(ox+2, oy+4, GxEPD_BLACK);
+            display.drawPixel(ox+4, oy+4, GxEPD_BLACK);
+        };
+        auto drawSIMIcon = [&](int ox, int oy) {
+            display.drawFastHLine(ox+1, oy,   4, GxEPD_BLACK);
+            display.drawPixel(ox,   oy+1, GxEPD_BLACK);
+            display.drawPixel(ox+4, oy+1, GxEPD_BLACK);
+            display.drawFastHLine(ox+1, oy+2, 3, GxEPD_BLACK);
+            display.drawPixel(ox,   oy+3, GxEPD_BLACK);
+            display.drawPixel(ox+4, oy+3, GxEPD_BLACK);
+            display.drawFastHLine(ox, oy+4, 5, GxEPD_BLACK);
+        };
+
+        if (s.apModeSnap) {
+            // ── AP mode: SSID in row 1, IP in row 2 ───────────────────────
+            display.setCursor(2, 9);
+            display.print(s.footerRow1);  // "CallerBot-XXXXXXXX"
+            display.drawFastHLine(0, 11, 212, GxEPD_BLACK);
+            display.setCursor(2, 21);
+            display.print(s.footerRow2);  // AP IP
+            display.drawFastHLine(0, 23, 212, GxEPD_BLACK);
+        } else {
+            // ── Row 1: [GSM icon][GSM bars] · [operator] · [WiFi icon][WiFi bars][IP] ──
+            drawGSMIcon(1);
+            drawNokiaBars(6, s.gsmBars);
+
+            // Nokia battery at original position (top-right, row 1)
+            const int battX = 190, battY = 1;
+            display.drawRect(battX,      battY,     16, 9, GxEPD_BLACK);
+            display.fillRect(battX + 16, battY + 2,  3,  5, GxEPD_BLACK);
+            for (int i = 0; i < s.battLevel + 1; i++)
+                if (s.charging) {
+                    display.fillRect(battX + 2 + i * 3, battY + 2, 2, 5, GxEPD_RED);
+                } else {
+                    display.fillRect(battX + 2 + i * 3, battY + 2, 2, 5, GxEPD_BLACK);
+                }
+
+            // if (s.charging) {
+            //     const int lx = battX - 11, ly = battY + 1;
+            //     display.drawFastHLine(lx + 4, ly,     2, GxEPD_RED);
+            //     display.drawFastHLine(lx + 3, ly + 1, 2, GxEPD_RED);
+            //     display.drawFastHLine(lx + 2, ly + 2, 2, GxEPD_RED);
+            //     display.drawFastHLine(lx + 1, ly + 3, 5, GxEPD_RED);
+            //     display.drawFastHLine(lx,     ly + 4, 5, GxEPD_RED);
+            //     display.drawFastHLine(lx + 2, ly + 5, 2, GxEPD_RED);
+            //     display.drawFastHLine(lx + 1, ly + 6, 2, GxEPD_RED);
+            //     display.drawFastHLine(lx,     ly + 7, 2, GxEPD_RED);
+            // }
+
+            // IP: right-aligned, ending 12px before battery (x=188)
+            display.getTextBounds(s.footerRow1.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+            int x_ip = battX - 2 - (int)tbw;  // ends at battX-2=188
+            display.setCursor(x_ip, 3);
+            display.print(s.footerRow1);
+
+            // WiFi bars + icon just before IP (2px gap)
+            int wifiBarsStart = x_ip - 17;
+            drawNokiaBars(wifiBarsStart, s.wifiBars);
+            drawWiFiIcon(wifiBarsStart - 5);
+
+            // Operator centred between left block (x=23) and WiFi icon
+            if (s.operatorName.length()) {
+                int midLeft  = 24;
+                int midRight = wifiBarsStart - 11;
+                display.getTextBounds(s.operatorName.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+                int opX = midLeft + max(0, (midRight - midLeft - (int)tbw) / 2) - tbx;
+                display.setCursor(max(midLeft, opX), 3);
+                display.print(s.operatorName);
+            }
+
+            display.drawFastHLine(0, 11, 212, GxEPD_RED);
+
+            // ── Row 2: [date] [balance fields] ────────────────────────────
+            display.setCursor(2, 21);
+            display.print(s.dateStr);  // "DD.MM.YY"
+
+            // Balance items packed from x=52 (after 48px date + 2px gap)
+            int bx = 52;
+            if (s.balMinutes.length()) {
+                drawClockIcon(bx, 15);
+                display.setCursor(bx + 7, 21);
+                display.print(s.balMinutes + "m");
+                bx += 7 + (int)(s.balMinutes.length() + 1) * 6 + 1;
+            }
+            if (s.balNextPay.length()) {
+                drawCalendarIcon(bx, 15);
+                display.setCursor(bx + 7, 21);
+                display.print(s.balNextPay);
+                bx += 7 + (int)s.balNextPay.length() * 6 + 1;
+            }
+            if (s.balExpiry.length()) {
+                drawSIMIcon(bx, 15);
+                display.setCursor(bx + 7, 21);
+                display.print(s.balExpiry);
+            }
+
+            // display.drawFastHLine(0, 23, 212, GxEPD_BLACK);
         }
 
-        // Nokia battery: body 16×10, positive nub 3×6, 4 internal 2-px segments
-        // Segments fill left→right: 1 segment = 25%, 4 = 100%
-        const int battX = 190, battY = 1;
-        display.drawRect(battX,      battY,     16, 10, GxEPD_BLACK);  // body outline
-        display.fillRect(battX + 16, battY + 2,  3,  6, GxEPD_BLACK);  // positive nub
-        for (int i = 0; i < ip5.battLevel + 1; i++) {
-            display.fillRect(battX + 2 + i * 3, battY + 2, 2, 6, GxEPD_BLACK);
-        }
-
-        // Charging: 6x8 px red pixel lightning bolt, left of battery
-        if (ip5.charging) {
-            const int lx = battX - 11, ly = battY + 1;
-            //  ....##
-            //  ...##
-            //  ..##
-            //  .#####
-            //  #####
-            //  ..##
-            //  .##
-            //  ##
-            display.drawFastHLine(lx + 4, ly,     2, GxEPD_RED);
-            display.drawFastHLine(lx + 3, ly + 1, 2, GxEPD_RED);
-            display.drawFastHLine(lx + 2, ly + 2, 2, GxEPD_RED);
-            display.drawFastHLine(lx + 1, ly + 3, 5, GxEPD_RED);
-            display.drawFastHLine(lx,     ly + 4, 5, GxEPD_RED);
-            display.drawFastHLine(lx + 2, ly + 5, 2, GxEPD_RED);
-            display.drawFastHLine(lx + 1, ly + 6, 2, GxEPD_RED);
-            display.drawFastHLine(lx,     ly + 7, 2, GxEPD_RED);
-        }
-
-        // ── Main status ───────────────────────────────────────────────────────
+        // ── Main status ────────────────────────────────────────────────────────
         display.setFont(&FreeSansBold12pt7b);
-        display.setTextColor(useColor ? GxEPD_RED : GxEPD_BLACK);
-        display.getTextBounds(statusText.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
-        display.setCursor((212 - tbw) / 2 - tbx, 48);
-        display.print(statusText);
+        display.setTextColor(s.useColor ? GxEPD_RED : GxEPD_BLACK);
+        display.getTextBounds(s.statusText.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+        display.setCursor((212 - tbw) / 2 - tbx, 55);
+        display.print(s.statusText);
 
-        // ── Subtext ───────────────────────────────────────────────────────────
-        if (subtextLine.length()) {
-            String sub = toDisplayStr(subtextLine);
+        // ── Subtext ────────────────────────────────────────────────────────────
+        if (s.subtextLine.length()) {
             display.setFont(&FreeSans9pt7b);
             display.setTextColor(GxEPD_BLACK);
-            display.getTextBounds(sub.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
-            display.setCursor((212 - tbw) / 2 - tbx, 65);
-            display.print(sub);
+            display.getTextBounds(s.subtextLine.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+            display.setCursor((212 - tbw) / 2 - tbx, 73);
+            display.print(s.subtextLine);
         }
 
-        // ── Footer ────────────────────────────────────────────────────────────
-        // display.drawFastHLine(0, 72, 212, GxEPD_BLACK);
-        display.setFont(nullptr);
-        display.setTextSize(1);
-        display.setTextColor(GxEPD_BLACK);
-
-        if (apMode) {
-            // AP mode: row1=SSID, row2=IP
-            display.setCursor(2, 83);
-            display.print(footerRow1);
-            display.setCursor(2, 97);
-            display.print(footerRow2);
-        } else {
-            // STA mode: row1 = date | IP, row2 = last command
-            display.setCursor(2, 14);
-            display.print(dateStr);
-            display.setCursor(2, 92);
-            display.print(footerRow2);
+        // ── Footer: last call ──────────────────────────────────────────────────
+        if (!s.apModeSnap) {
+            display.setFont(nullptr);
+            display.setTextSize(1);
+            display.setTextColor(GxEPD_BLACK);
+            display.setCursor(2, 95);
+            display.print(s.footerRow2);
         }
 
     } while (display.nextPage());
+}
+
+// FreeRTOS display task pinned to Core 0.
+// Core 1 (loop()) posts snapshots and returns immediately — never blocks on SPI.
+static void displayTask(void*) {
+    DisplaySnapshot local;
+    while (true) {
+        xSemaphoreTake(snapSignal, portMAX_DELAY);
+        xSemaphoreTake(snapMutex, portMAX_DELAY);
+        local = pendingSnap;
+        xSemaphoreGive(snapMutex);
+        renderSnapshot(local);
+    }
+}
+
+// Capture current system state into a snapshot, signal display task, return immediately.
+// I2C (IP5306) and AT (modem) reads happen here on Core 1 — safe and sequential.
+// The 15-20 s SPI render runs on Core 0 without blocking loop().
+void drawDisplay(const String& statusText, const String& subtextLine, bool useColor) {
+    if (!displayOk) return;
+
+    DisplaySnapshot snap;
+    snap.statusText  = statusText;
+    snap.subtextLine = toDisplayStr(subtextLine);
+    snap.useColor    = useColor;
+    snap.apModeSnap  = apMode;
+
+    snap.wifiBars = 0;
+    if (!apMode && WiFi.isConnected()) {
+        int rssi = WiFi.RSSI();
+        snap.wifiBars = rssi >= -50 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : 1;
+    }
+    if (modemOk) {
+        int csq       = modem.getSignalQuality();
+        snap.gsmBars  = (csq == 99 || csq == 0) ? 0 : max(1, min(4, csq * 4 / 31 + 1));
+        snap.operatorName = modem.getOperator();
+    }
+    IP5306State ip5 = readIP5306();
+    snap.battLevel = ip5.battLevel;
+    snap.charging  = ip5.charging;
+    snap.dateStr   = getDateStr();
+
+    if (apMode) {
+        snap.footerRow1 = "CallerBot-" + String((uint32_t)(ESP.getEfuseMac() >> 32), HEX);
+        snap.footerRow2 = WiFi.softAPIP().toString();
+    } else {
+        snap.footerRow1 = WiFi.isConnected() ? WiFi.localIP().toString() : "offline";
+        snap.footerRow2 = lastCmdLabel.length()
+            ? toDisplayStr(lastCmdLabel) + " @" + lastCmdTime
+                + (lastCmdUser.length() ? " " + toDisplayStr(lastCmdUser) : "")
+            : "No calls yet";
+    }
+
+    snap.balMinutes = lastBalance.minutes;
+    snap.balNextPay = lastBalance.nextPay;
+    snap.balExpiry  = lastBalance.expiry;
+
+    xSemaphoreTake(snapMutex, portMAX_DELAY);
+    pendingSnap = snap;
+    xSemaphoreGive(snapMutex);
+    xSemaphoreGive(snapSignal);  // binary: stays given if task busy — "latest wins"
 }
 
 void displayIdle(const String& sub) {
@@ -729,10 +1004,24 @@ void displayCalling(const String& label) {
 }
 
 void initDisplay() {
+    // Pre-check BUSY: if HIGH before init the UC8151 is wedged (e.g. from a
+    // brownout mid-refresh). display.init() would block forever waiting for it
+    // to clear → Interrupt WDT kills both cores. Skip display instead.
+    pinMode(EPAPER_BUSY, INPUT);
+    if (digitalRead(EPAPER_BUSY) == HIGH) {
+        Serial.println("WARN: e-paper BUSY stuck HIGH — display skipped (power-cycle to recover)");
+        return;
+    }
+
     epaperSPI.begin(EPAPER_CLK, -1, EPAPER_MOSI, EPAPER_CS);
     display.epd2.selectSPI(epaperSPI, SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    // Use 50 ms busy-poll interval instead of GxEPD2's default 1 ms.
+    // 1 ms → ~30 000 vTaskDelay calls per 30 s refresh → inter-core FreeRTOS
+    // spinlock contention between display task (Core 0) and loop (Core 1) → INT WDT.
+    display.epd2.setBusyCallback([](const void*){ delay(50); }, nullptr);
     display.init(0, true, 200, false);
     display.setRotation(cfg.displayFlip ? 3 : 1);
+    displayOk = true;
     drawDisplay("Starting...", "", false);
     Serial.println("Display OK.");
 }
@@ -740,6 +1029,17 @@ void initDisplay() {
 // ─── Hardware init ────────────────────────────────────────────────────────────
 
 void initPowerManagement() {
+    // I2C bus recovery: IP5306 can clock-stretch-hold SDA low after a dirty
+    // (brownout) reset, making Wire.begin() fail with "could not acquire lock".
+    // Manually clock SCL up to 9 times to let the slave release SDA.
+    pinMode(I2C_SDA, INPUT_PULLUP);
+    pinMode(I2C_SCL, OUTPUT);
+    for (int i = 0; i < 9 && digitalRead(I2C_SDA) == LOW; i++) {
+        digitalWrite(I2C_SCL, LOW);  delayMicroseconds(5);
+        digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
+    }
+    pinMode(I2C_SCL, INPUT_PULLUP);
+
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.beginTransmission(IP5306_ADDR);
     Wire.write(IP5306_REG_SYS_CTL0);
@@ -781,9 +1081,11 @@ void initModem() {
         powerCycleModem();
         if (!modem.init()) {
             Serial.println("FATAL: modem.init() failed after power cycle — halting");
+            drawDisplay("MODEM FAIL", "Power cycle device", true);
             while (true) delay(1000);
         }
     }
+    modemOk = true;
     Serial.println("Modem OK.");
 
     Serial.print("Waiting for network");
@@ -805,6 +1107,7 @@ void initModem() {
 // ESP32 stayed alive via USB, then VIN was reconnected without an ESP32 reset).
 void recoverModem() {
     Serial.println("Modem watchdog: recovery start");
+    modemOk = false;
     modemSerial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     delay(100);
     if (!modem.init()) {
@@ -815,6 +1118,7 @@ void recoverModem() {
             return;
         }
     }
+    modemOk = true;
     for (int i = 0; i < 15 && !modem.isNetworkConnected(); i++)
         delay(1000);
     Serial.printf("Modem recovery OK, CSQ=%d\n", modem.getSignalQuality());
@@ -866,8 +1170,14 @@ void setup() {
     }
     loadConfig();
 
-    initDisplay();        // show "Starting..." early
-    initPowerManagement();
+    initPowerManagement(); // enable IP5306 boost FIRST — display refresh draws peak
+                           // current and browns out on battery if boost not always-on
+
+    snapMutex  = xSemaphoreCreateMutex();
+    snapSignal = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(displayTask, "display", 4096, nullptr, 1, nullptr, 0);
+
+    initDisplay();         // show "Starting..." early — posts first snapshot to task
     {   // seed battery state so first keep-alive check doesn't trigger false display refresh
         IP5306State ip5 = readIP5306();
         lastBattLevel = ip5.battLevel;
@@ -892,6 +1202,13 @@ void setup() {
     else
         Serial.println("Web admin: http://" + WiFi.localIP().toString());
     Serial.println("Ready.");
+
+    // Fetch balance at boot so display shows it immediately on first idle render
+    if (!apMode && modemOk && cfg.ussdCode.length() && modem.isNetworkConnected()) {
+        Serial.println("Boot: fetching USSD balance...");
+        String resp = ussdRaw(cfg.ussdCode);
+        if (resp.length()) lastBalance = parseBalance(resp);
+    }
 
     displayIdle();
 }
@@ -959,7 +1276,7 @@ void loop() {
             lastCharging = ip5.charging;
             if (ip5.battLevel != lastBattLevel) {
                 lastBattLevel = ip5.battLevel;
-                displayIdle("");
+                displayIdle(ip5.battLevel == 0 ? "Charge now! 25%" : "");
             }
         }
     }

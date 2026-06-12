@@ -46,23 +46,82 @@ display.setRotation(cfg.displayFlip ? 3 : 1);  // 1=landscape, 3=landscape flipp
 
 Drawing coordinate system (rotation=1 or 3): width=212, height=104.
 
-Font support: FreeSans covers Latin-1 only. Use `toDisplayStr()` (line 531) to transliterate Cyrillic and strip emojis before printing user-supplied strings.
+Font support: FreeSans covers Latin-1 only. Use `toDisplayStr()` (line ~699) to transliterate Cyrillic and strip emojis before printing user-supplied strings.
 
-### Header layout (Nokia 3310 pixel-art style)
+### Display layout
 
-Status bar is 17 px tall. All values cached before `display.firstPage()` — no I2C/AT inside render loop.
+Two header rows, then status body, then footer.
 
-| Region | x | Content |
-|--------|---|---------|
-| WiFi icon | 1..7 | 5×5 px fan-arc pixel art |
-| WiFi bars | 8..22 | 4 Nokia bars (3 px wide, heights 2/4/6/8, filled=solid / empty=outline) |
-| Antenna icon | 26..30 | 5×5 px broadcast-tower pixel art |
-| GSM bars | 32..46 | same style |
-| Date | centre | DD.MM.YY — default 5×7 font |
-| Bolt | battX−11 | 6×8 px red pixel lightning bolt — shown when `ip5.charging` |
-| Battery | 190..208 | Nokia body 16×10, nub 3×6, 4 internal 2-px segments (1=25%…4=100%) |
+**Row 1 (y=0–10):** Signal + operator + IP + battery
+| Region | Position | Content |
+|--------|----------|---------|
+| GSM tower icon | x=1–5 | 5×5 px broadcast-tower pixel art |
+| GSM bars | x=8–22 | 4 Nokia bars |
+| Operator name | centred between GSM and WiFi | default 5×7 font |
+| WiFi fan icon | dynamic (before bars) | 7×5 px fan-arc pixel art |
+| WiFi bars | dynamic (before IP) | 4 Nokia bars |
+| IP address | right-aligned, ends at x=188 | default font |
+| Battery | x=190–208, y=1 | Nokia body 16×10, nub 3×6, 4 segments |
+| Charging bolt | x=179–184, y=2 | 6×8 px red lightning bolt |
+
+WiFi bars/icon x positions computed at render time: `wifiBarsStart = (battX-2-ip_width) - 17`. Operator centred between x=24 and WiFi icon left edge.
+
+Separator line at y=11.
+
+**Row 2 (y=12–22):** Date + USSD balance
+| Region | Position | Content |
+|--------|----------|---------|
+| Date | x=2, baseline y=21 | DD.MM.YY |
+| Clock icon + minutes | x=52+, y=15 | 5×5 px clock + "15m" |
+| Calendar icon + nextPay | dynamic | 5×5 px calendar + "DD.MM" (month only, no year) |
+| SIM icon + expiry | dynamic | 5×5 px SIM card + "DD.MM.YY" (full date — year matters) |
+
+Balance items packed left from x=52. Max combined width ~116px — clears battery bolt at x=179.
+
+Separator line at y=23.
+
+**Body (y=24–85):**
+- Status text ("IDLE" / "CALLING") in FreeSansBold12pt7b, baseline y=55, centred
+- Subtext in FreeSans9pt7b, baseline y=73, centred
+
+**Footer (y=95):** Last call — label @HH:MM username
 
 Empty bars use `GxEPD_RED` outline (not black) — intentional visual distinction.
+
+### Display task (non-blocking rendering)
+
+Rendering runs on **Core 0** in `displayTask`. Core 1 (`loop()`) fills a `DisplaySnapshot` struct, signals via binary semaphore, and returns immediately. The 15–20 s SPI refresh never blocks `loop()`.
+
+```cpp
+xTaskCreatePinnedToCore(displayTask, "display", 4096, nullptr, 1, nullptr, 0);
+```
+
+`drawDisplay()` on Core 1: reads I2C (IP5306) and AT (modem), fills snapshot, gives semaphore.
+`renderSnapshot()` on Core 0: reads only pre-cached snapshot values — NO I2C/AT inside.
+
+### INT WDT fix
+
+GxEPD2 `_waitWhileBusy` calls `delay(1)` ~30,000 times per 30 s refresh. This causes FreeRTOS spinlock contention between Core 0 (display task) and Core 1 (loop), triggering Interrupt WDT.
+
+Fix: set busy-poll interval to 50 ms:
+```cpp
+display.epd2.setBusyCallback([](const void*){ delay(50); }, nullptr);
+```
+Reduces context switches from ~30,000 to ~600 per refresh.
+
+### Busy timeout
+
+UC8151 refresh can exceed GxEPD2's default 20 s timeout. Override via subclass:
+```cpp
+struct GxEPD2_213c_30s : public GxEPD2_213c {
+    GxEPD2_213c_30s(...) : GxEPD2_213c(...) { _busy_timeout = 40000000; }
+};
+```
+Do NOT edit `.pio/libdeps/` — gets overwritten on clean. Subclass in main.cpp only.
+
+### BUSY stuck HIGH guard
+
+If BUSY pin is HIGH before `display.init()`, the UC8151 is wedged (e.g. from brownout mid-refresh). `display.init()` would block forever. `initDisplay()` pre-checks and sets `displayOk = false` if HIGH — device continues without display until power-cycle.
 
 ---
 
@@ -70,7 +129,7 @@ Empty bars use `GxEPD_RED` outline (not black) — intentional visual distinctio
 
 `UniversalTelegramBot` GET-based polling works fine. Its `sendMessageWithInlineKeyboard` (POST) is broken — the SSL connection left open by `getUpdates` is in a bad state for subsequent POSTs.
 
-Fix: custom `tgPost(method, body)` at line 146 opens a **fresh `WiFiClientSecure`** per call, uses **HTTP/1.0** (no chunked encoding), reads until disconnected. All keyboard messages go through `tgPost`.
+Fix: custom `tgPost(method, body)` at line ~193 opens a **fresh `WiFiClientSecure`** per call, uses **HTTP/1.0** (no chunked encoding), reads until disconnected. All keyboard messages go through `tgPost`.
 
 Bot is created after WiFi connects:
 ```cpp
@@ -79,6 +138,33 @@ bot->getUpdates(bot->last_message_received + 1);  // drain stale messages
 ```
 
 Polling only in STA mode (not AP mode) in `loop()`.
+
+### Admin access control
+
+`isAdmin(userId)` checks `cfg.adminUserId != 0 && userId == cfg.adminUserId`.
+
+Admin-only keyboard buttons: Status, Balance (USSD), Reboot. "My ID" shown to everyone.
+
+---
+
+## USSD
+
+TinyGSM `sendUSSDImpl` is broken for SIM800: some firmware sends `+CUSD:` before `OK`, so the first `waitResponse()` consumes `+CUSD:` and the second returns empty.
+
+Fix: `ussdRaw(code)` at line ~449 — sends `AT+CUSD=1,"code"` raw, reads serial for up to 15 s, finds `+CUSD:` manually. Handles DCS=72 (UCS2 hex → UTF-8 decode) and DCS=15 (plain ASCII).
+
+### Balance parsing
+
+`parseBalance(response)` at line ~425 extracts from USSD response:
+- `minutes`: digits before first `"hv"` (e.g. `"15hv"` → `"15"`)
+- `nextPay`: 5 chars (DD.MM) after `"poslug "` — year dropped to save display space
+- `expiry`: 8 chars (DD.MM.YY) after `"diye do "` — year kept, matters for SIM validity
+
+Stored in `lastBalance` global. Refreshed:
+1. At boot (after modem + network ready) — silently, no Telegram message
+2. After each Balance command from Telegram
+
+After update, `displayIdle("")` is called to refresh the display.
 
 ---
 
@@ -111,6 +197,8 @@ if (!modem.init()) → powerCycleModem() → if (!modem.init()) → FATAL halt
 
 Network registration waits up to 60 s, then warns and continues (non-fatal — device still works for WiFi/web even without GSM).
 
+`modemOk` flag: set to `true` after successful `modem.init()`. Guards all AT calls in `drawDisplay()` and `handleCall()`. Cleared in `recoverModem()` during recovery attempt.
+
 ### Modem watchdog (`loop()`)
 
 AT ping every 30 s while IDLE. Two consecutive failures → `recoverModem()`:
@@ -128,7 +216,7 @@ SYS_CTL0=0x37 re-written every 20 s (via `Wire`). IP5306 auto-shuts-off boost af
 
 ## Call progress
 
-AT+CLCC polled every 4 s while `callState == CALLING`. `tickCallProgress()` at line 195.
+AT+CLCC polled every 4 s while `callState == CALLING`. `tickCallProgress()` at line ~242.
 
 GsmCallStat enum mirrors AT+CLCC stat field: NONE=-1, ACTIVE=0, HELD=1, DIALING=2, ALERTING=3, INCOMING=4, WAITING=5.
 
@@ -150,7 +238,8 @@ All config fields:
 | `wifi_password` | string | — | |
 | `bot_token` | string | — | from @BotFather |
 | `admin_password` | string | `"admin"` | web + OTA auth |
-| `ussd_code` | string | — | sent by Echo button |
+| `admin_user_id` | long | 0 | Telegram user ID for admin commands; 0 = disabled |
+| `ussd_code` | string | — | sent by Balance button and on boot |
 | `call_timeout_s` | int | 60 | auto-hangup |
 | `gmt_offset_h` | int | 2 | UTC offset for NTP |
 | `display_flip` | bool | false | rotate display 180° |
@@ -197,7 +286,7 @@ If `pio` not in PATH: `export PATH="$HOME/.platformio/penv/bin:$PATH"`
 
 ## IP5306 battery reading
 
-`readIP5306()` at line 320 reads two registers via I2C:
+`readIP5306()` at line ~389 reads two registers via I2C:
 
 | Reg | Bit | Meaning |
 |-----|-----|---------|
@@ -220,47 +309,54 @@ Display refresh triggers only on `battLevel` change, NOT on `charging` change. R
 
 | Line | Function | Purpose |
 |------|----------|---------|
-| 90 | `loadConfig()` | read LittleFS /config.json → cfg struct |
-| 127 | `saveConfigFromJson()` | write raw JSON to LittleFS, reload cfg |
-| 137 | `isAllowedForAlias()` | per-alias auth check |
-| 151 | `tgPost()` | fresh-connection HTTPS POST to Telegram API |
-| 200 | `tickCallProgress()` | poll AT+CLCC, send progress messages |
-| 231 | `isAnyAllowed()` | true if user in any alias allow list |
-| 239 | `buildKeyboard()` | JSON inline_keyboard for sendMenu |
-| 279 | `sendMenu()` | send message + inline keyboard via tgPost |
-| 289 | `hangupCall()` | AT hangup + state reset + displayIdle |
-| 294 | `handleCall()` | dial alias, update state, displayCalling |
-| 313 | `IP5306State` | struct: battLevel, charging, chargeFull, vinPresent |
-| 320 | `readIP5306()` | read reg 0x70 + 0x78 → IP5306State |
-| 341 | `sendStatus()` | GSM CSQ + IP5306 battery → Telegram message |
-| 356 | `sendUSSD()` | send cfg.ussdCode, return response |
-| 366 | `handleMessage()` | dispatch incoming Telegram messages |
-| 450 | `checkAuth()` | HTTP Basic Auth for web routes |
-| 458 | `initWebServer()` | register all routes + ElegantOTA |
-| 500 | `initNTP()` | configTime() + wait for sync |
-| 512 | `getTimeStr()` | HH:MM from NTP |
-| 520 | `getDateStr()` | DD.MM.YY from NTP |
-| 531 | `toDisplayStr()` | Cyrillic UTF-8 → Latin + strip emojis |
-| 565 | `drawDisplay()` | full e-paper render (Nokia header, status, footer) |
-| 723 | `displayIdle()` | wrapper: drawDisplay("IDLE", ..., false) |
-| 727 | `displayCalling()` | wrapper: drawDisplay("CALLING", ..., true) |
-| 731 | `initDisplay()` | HSPI + GxEPD2 init, "Starting..." screen |
-| 742 | `initPowerManagement()` | IP5306 I2C — set SYS_CTL0=0x37 |
-| 754 | `powerCycleModem()` | PWRKEY pulse sequence |
-| 772 | `initModem()` | probe → optional power cycle → network wait (FATAL on failure) |
-| 806 | `recoverModem()` | non-fatal modem recovery for loop() watchdog |
-| 824 | `startAP()` | WiFi.softAP("CallerBot-XXXXXXXX") |
-| 833 | `initWiFi()` | STA connect 30 s → fallback startAP() |
-| 858 | `setup()` | full init sequence |
-| 899 | `loop()` | OTA + watchdog + CLCC poll + keep-alive + bot poll |
+| 131 | `loadConfig()` | read LittleFS /config.json → cfg struct |
+| 169 | `saveConfigFromJson()` | write raw JSON to LittleFS, reload cfg |
+| 179 | `isAllowedForAlias()` | per-alias auth check |
+| 193 | `tgPost()` | fresh-connection HTTPS POST to Telegram API |
+| 242 | `tickCallProgress()` | poll AT+CLCC, send progress messages |
+| 273 | `isAnyAllowed()` | true if user in any alias allow list |
+| 279 | `isAdmin()` | true if userId == cfg.adminUserId |
+| 285 | `buildKeyboard()` | JSON inline_keyboard; admin buttons gated by isAdmin() |
+| 338 | `sendMenu()` | send message + inline keyboard via tgPost |
+| 348 | `hangupCall()` | AT hangup + state reset + displayIdle |
+| 353 | `handleCall()` | dial alias, update state, displayCalling |
+| 382 | `IP5306State` | struct: battLevel, charging, chargeFull, vinPresent |
+| 389 | `readIP5306()` | read reg 0x70 + 0x78 → IP5306State |
+| 410 | `sendStatus()` | GSM CSQ + IP5306 battery → Telegram message |
+| 425 | `parseBalance()` | extract minutes/nextPay/expiry from USSD response string |
+| 449 | `ussdRaw()` | raw AT+CUSD send + 15 s serial read + DCS decode |
+| 498 | `sendUSSD()` | isNetworkConnected guard + ussdRaw + parseBalance + displayIdle |
+| 518 | `handleMessage()` | dispatch incoming Telegram messages |
+| 618 | `checkAuth()` | HTTP Basic Auth for web routes |
+| 626 | `initWebServer()` | register all routes + ElegantOTA |
+| 668 | `initNTP()` | configTime() + wait for sync |
+| 680 | `getTimeStr()` | HH:MM from NTP |
+| 688 | `getDateStr()` | DD.MM.YY from NTP |
+| 699 | `toDisplayStr()` | Cyrillic UTF-8 → Latin + strip emojis |
+| 739 | `renderSnapshot()` | full e-paper render (called from display task, Core 0) |
+| 939 | `displayTask()` | FreeRTOS task on Core 0: waits on snapSignal, calls renderSnapshot |
+| 953 | `drawDisplay()` | fills DisplaySnapshot (I2C + AT on Core 1), signals display task |
+| 998 | `displayIdle()` | wrapper: drawDisplay("IDLE", ..., false) |
+| 1002 | `displayCalling()` | wrapper: drawDisplay("CALLING", ..., true) |
+| 1006 | `initDisplay()` | HSPI + GxEPD2 init + busy callback + "Starting..." |
+| 1031 | `initPowerManagement()` | I2C bus recovery + Wire.begin + IP5306 boost always-on |
+| 1054 | `powerCycleModem()` | PWRKEY pulse sequence |
+| 1072 | `initModem()` | probe → optional power cycle → network wait (FATAL on failure) |
+| 1108 | `recoverModem()` | non-fatal modem recovery for loop() watchdog |
+| 1128 | `startAP()` | WiFi.softAP("CallerBot-XXXXXXXX") |
+| 1137 | `initWiFi()` | STA connect 30 s → fallback startAP() |
+| 1162 | `setup()` | full init sequence + boot USSD balance fetch |
+| 1216 | `loop()` | OTA + watchdog + CLCC poll + keep-alive + bot poll |
 
 ---
 
 ## Known issues / watch-outs
 
 - GSM network registration often fails (WARN after 60 s) if 2G coverage is marginal — device continues without GSM, calls don't work but web admin and WiFi do.
-- 3-colour e-paper refresh is slow (15–20 s). Only update display on call start, call end, boot, and battery level change — never in polling loops.
-- AP mode: Telegram polling is disabled (bot is null in AP mode). Only web admin works.
+- 3-colour e-paper refresh is slow (15–20 s). Only update display on call start, call end, boot, balance query, and battery level change — never in polling loops.
+- AP mode: Telegram polling is disabled (bot is null in AP mode). Only web admin works. Balance not fetched in AP mode.
 - `display_flip` in config requires restart to take effect (setRotation is called in initDisplay only).
 - IP5306 battery level bit mapping (`(~r2) & 0x03`) was determined empirically. If levels show inverted on hardware, change to `r2 & 0x03` in `readIP5306()`.
 - Modem watchdog adds ~1 s blocking AT call every 30 s during idle. If this causes Telegram message latency, increase the interval.
+- Boot USSD fetch adds up to 15 s to startup time (ussdRaw timeout). Only runs if modem registered and ussd_code configured.
+- Charging bolt (x=179–184) can visually overlap with IP address text in row 1 when charging AND IP ends near x=185+. Rare in practice — bolt only shown when charging.

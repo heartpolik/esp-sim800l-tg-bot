@@ -3,6 +3,7 @@
   "wifi_password": "your_wifi_password",
   "bot_token": "123456789:ABCxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "admin_password": "changeme",
+  "admin_user_id": 123456789,
   "ussd_code": "*123#",
   "call_timeout_s": 60,
   "gmt_offset_h": 2,

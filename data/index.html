@@ -58,6 +58,7 @@
     <div class="field"><label>WiFi Password</label><input id="wifi_password" type="password" placeholder="••••••••"></div>
     <div class="field"><label>Telegram Bot Token</label><input id="bot_token" placeholder="123456789:ABCxxxxx"></div>
     <div class="field"><label>Admin Panel Password</label><input id="admin_password" type="password" placeholder="changeme"></div>
+    <div class="field"><label>Admin Telegram User ID</label><input id="admin_user_id" type="number" placeholder="269915377"></div>
   </div>
 
   <!-- USSD + Call settings -->
@@ -102,6 +103,7 @@ async function loadConfig() {
     document.getElementById('wifi_password').value  = config.wifi_password  || '';
     document.getElementById('bot_token').value      = config.bot_token      || '';
     document.getElementById('admin_password').value = config.admin_password || '';
+    document.getElementById('admin_user_id').value  = config.admin_user_id  || '';
     document.getElementById('ussd_code').value      = config.ussd_code      || '';
     document.getElementById('call_timeout_s').value = config.call_timeout_s || 60;
     document.getElementById('display_flip').checked  = config.display_flip   || false;
@@ -180,6 +182,8 @@ async function saveConfig() {
   config.wifi_password  = document.getElementById('wifi_password').value;
   config.bot_token      = document.getElementById('bot_token').value.trim();
   config.admin_password = document.getElementById('admin_password').value;
+  const adminIdVal = parseInt(document.getElementById('admin_user_id').value);
+  config.admin_user_id  = isNaN(adminIdVal) ? 0 : adminIdVal;
   config.ussd_code      = document.getElementById('ussd_code').value.trim();
   config.call_timeout_s = parseInt(document.getElementById('call_timeout_s').value) || 60;
   config.display_flip   = document.getElementById('display_flip').checked;
