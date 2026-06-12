@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "esp_task_wdt.h"
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -128,6 +129,8 @@ String lastCmdUser  = "";
 int           lastBattLevel   = -1;
 bool          lastCharging    = false;
 unsigned long lastBattCheckMs = 0;
+
+unsigned long lastWiFiConnectedMs = 0;  // millis() when WiFi was last up; WiFi watchdog
 
 // ─── Config IO ───────────────────────────────────────────────────────────────
 
@@ -1083,9 +1086,9 @@ void initModem() {
         Serial.println("Modem not responding — power cycling...");
         powerCycleModem();
         if (!modem.init()) {
-            Serial.println("FATAL: modem.init() failed after power cycle — halting");
-            drawDisplay("MODEM FAIL", "Power cycle device", true);
-            while (true) delay(1000);
+            Serial.println("FATAL: modem.init() failed after power cycle — restarting");
+            delay(3000);
+            ESP.restart();
         }
     }
     modemOk = true;
@@ -1144,6 +1147,7 @@ void initWiFi() {
         return;
     }
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
     Serial.print("Connecting to WiFi");
     unsigned long t = millis();
@@ -1158,6 +1162,7 @@ void initWiFi() {
     }
     Serial.println("\nWiFi: " + WiFi.localIP().toString());
     secureClient.setInsecure();
+    secureClient.setTimeout(15000);  // cap SSL reads — prevents infinite block on bad connection
 }
 
 // ─── Arduino entry points ─────────────────────────────────────────────────────
@@ -1219,9 +1224,19 @@ void setup() {
     }
 
     displayIdle();
+
+    // Enable hardware task watchdog on loop task.
+    // 120 s is enough for worst-case recoverModem (~80 s) + bot poll + USSD.
+    // If loop() hangs beyond that (e.g. SSL deadlock, lwIP bug) → auto-reset.
+    // Display task intentionally excluded — it legitimately blocks 15-20 s per render.
+    esp_task_wdt_init(120, true);  // 120 s timeout, reset on expiry
+    esp_task_wdt_add(NULL);        // subscribe loop task
+    lastWiFiConnectedMs = millis();
 }
 
 void loop() {
+    esp_task_wdt_reset();  // feed watchdog; must happen at least every 120 s
+
     // delayed restart after config save
     if (shouldRestart && millis() - restartAfterMs > 2000) {
         Serial.println("Restarting...");
@@ -1267,10 +1282,22 @@ void loop() {
         }
     }
 
-    // IP5306 keep-alive every 20 s: re-write SYS_CTL0 to prevent auto power-off on battery.
+    // WiFi watchdog: if STA mode and WiFi lost for >5 min, restart cleanly.
+    // WiFi.setAutoReconnect(true) handles brief drops; this catches prolonged outages
+    // where the reconnect state machine stalls (observed on some ESP32 revisions).
+    if (!apMode) {
+        if (WiFi.isConnected()) {
+            lastWiFiConnectedMs = millis();
+        } else if (millis() - lastWiFiConnectedMs > 300000UL) {
+            Serial.println("WiFi lost >5 min — restarting");
+            ESP.restart();
+        }
+    }
+
+    // IP5306 keep-alive every 10 s: re-write SYS_CTL0 to prevent auto power-off on battery.
     // IP5306 shuts down boost after ~32 s of light load when VIN is absent; periodic write resets
     // that timer even if the load dips momentarily (e.g. during WiFi TX idle or sleep).
-    if (millis() - lastBattCheckMs >= 20000UL) {
+    if (millis() - lastBattCheckMs >= 10000UL) {
         lastBattCheckMs = millis();
         Wire.beginTransmission(IP5306_ADDR);
         Wire.write(IP5306_REG_SYS_CTL0);
